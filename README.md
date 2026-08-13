@@ -21,6 +21,8 @@ Current foundation:
 - Case-insensitive, spelling-preserving definition lookup
 - `textDocument/definition` for local variables, same-file `CALL`/`GC`, explicitly named `LM`/`LS`/`LB`/`LA` targets, and calls into explicitly loaded block files
 - `textDocument/references` from declarations or references, with `includeDeclaration`, cross-file overlays, deterministic ordering, and the same conservative ambiguity rules
+- Context-aware `textDocument/completion` for statement keywords/terminators, visible locals, static call/entity targets, and confirmed `.com` filename slots
+- Safe completion text edits for incomplete and quoted source, including doubled-quote escaping and mid-token replacement
 - Diagnostic clearing when a document closes
 
 Definition resolution is intentionally conservative: dynamic expressions and ambiguous targets return no result rather than guessing. The grammar dependency is versioned from [`github.com/LehMichael/tree-sitter-run-myscreens`](https://github.com/LehMichael/tree-sitter-run-myscreens).

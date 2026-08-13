@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/LehMichael/run-myscreens-lsp/internal/document"
+	"github.com/LehMichael/run-myscreens-lsp/internal/model"
 	"github.com/LehMichael/run-myscreens-lsp/internal/protocol"
 	"github.com/LehMichael/run-myscreens-lsp/internal/syntax"
 	"github.com/LehMichael/run-myscreens-lsp/internal/workspace"
@@ -211,6 +213,52 @@ func TestReferencesResolveCrossFileWithUTF16Ranges(t *testing.T) {
 	}
 }
 
+func TestCompletionProvidesKeywordsLocalsTargetsAndFiles(t *testing.T) {
+	root := t.TempDir()
+	sharedPath := filepath.Join(root, "Shared.com")
+	if err := os.WriteFile(sharedPath, []byte("//M(SharedMask)\n//END\n"), 0o600); err != nil {
+		t.Fatalf("write shared: %v", err)
+	}
+	tests := []struct {
+		name     string
+		source   string
+		position protocol.Position
+		label    string
+	}{
+		{"keyword", "//M(Main)\nLOAD\n  CA\nEND_LOAD\n//END\n", protocol.Position{Line: 2, Character: 4}, "CALL"},
+		{"local", "//M(Main)\nDEF value=(I/0/1)\nLOAD\n  IF value==1\n    va\n  ENDIF\nEND_LOAD\n//END\n", protocol.Position{Line: 4, Character: 6}, "value"},
+		{"entity after unicode", "//M(Main)\nLOAD\n  value=\"😀\" << LM(\"sha\nEND_LOAD\n//END\n", protocol.Position{Line: 2, Character: 23}, "SharedMask"},
+		{"filename", "//M(Main)\nLOAD\n  LS(\"Menu\", \"sha\nEND_LOAD\n//END\n", protocol.Position{Line: 2, Character: 17}, "Shared.com"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			uri := workspace.FileURI(filepath.Join(root, test.name+".com"))
+			input := bytes.NewBufferString(
+				frameJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"rootUri": workspace.FileURI(root), "capabilities": map[string]any{}}}) +
+					frameJSON(map[string]any{"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": "run-myscreens", "version": 1, "text": test.source}}}) +
+					frameJSON(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion", "params": map[string]any{"textDocument": map[string]any{"uri": uri}, "position": test.position}}),
+			)
+			var output bytes.Buffer
+			languageServer := New(protocol.NewConnection(input, &output), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
+			if err := languageServer.Run(context.Background()); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			messages := readMessages(t, &output)
+			var initialize protocol.InitializeResult
+			if err := json.Unmarshal(messageByID(t, messages, "1").Result, &initialize); err != nil {
+				t.Fatalf("decode initialize: %v", err)
+			}
+			if initialize.Capabilities.CompletionProvider == nil {
+				t.Fatal("completion provider was not advertised")
+			}
+			item := completionByLabel(t, messageByID(t, messages, "2"), test.label)
+			if item.TextEdit == nil || item.TextEdit.Range.End != test.position {
+				t.Fatalf("completion edit = %#v", item)
+			}
+		})
+	}
+}
+
 func TestReferencesConcurrencyRequiresInitializedActiveServer(t *testing.T) {
 	languageServer := New(protocol.NewConnection(bytes.NewReader(nil), io.Discard), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
 	message := protocol.Message{ID: json.RawMessage(`1`), Method: "textDocument/references"}
@@ -221,9 +269,13 @@ func TestReferencesConcurrencyRequiresInitializedActiveServer(t *testing.T) {
 	if !languageServer.isConcurrentRequest(message) {
 		t.Fatal("references was not concurrent after initialization")
 	}
+	completion := protocol.Message{ID: json.RawMessage(`2`), Method: "textDocument/completion"}
+	if !languageServer.isConcurrentRequest(completion) {
+		t.Fatal("completion was not concurrent after initialization")
+	}
 	languageServer.shutdown = true
-	if languageServer.isConcurrentRequest(message) {
-		t.Fatal("references dispatched concurrently after shutdown")
+	if languageServer.isConcurrentRequest(message) || languageServer.isConcurrentRequest(completion) {
+		t.Fatal("semantic request dispatched concurrently after shutdown")
 	}
 }
 
@@ -311,6 +363,67 @@ func readMessages(t *testing.T, output io.Reader) []protocol.Message {
 			t.Fatalf("read response: %v", err)
 		}
 		messages = append(messages, message)
+	}
+}
+
+func TestCompletionReplacesRemainderOfMidToken(t *testing.T) {
+	source := []byte("CALL(\"SharedMask\")")
+	offset := uint(len("CALL(\"Sha"))
+	completionContext, err := syntax.NewTreeSitterAnalyzer().CompletionContext(context.Background(), source, offset)
+	if err != nil {
+		t.Fatalf("CompletionContext: %v", err)
+	}
+	doc := document.New("file:///test.com", "run-myscreens", 1, string(source))
+	items := completionItems(doc, completionContext, []model.CompletionItem{{Label: "SharedMask", InsertText: "SharedMask", Kind: model.CompletionItemModule}})
+	if len(items) != 1 || items[0].TextEdit == nil || items[0].TextEdit.Range.End.Character != uint32(len(`CALL("SharedMask`)) {
+		t.Fatalf("completion items = %#v, context = %#v", items, completionContext)
+	}
+}
+
+func TestCompletionEscapesQuotesInTextEdit(t *testing.T) {
+	doc := document.New("file:///test.com", "run-myscreens", 1, "CALL(\"A \"\"q\")")
+	context := model.CompletionContext{Kind: model.CompletionTarget, Prefix: `A "q`, Quoted: true, ReplaceRange: model.ByteRange{Start: 6, End: 12}}
+	items := completionItems(doc, context, []model.CompletionItem{{Label: `A "quoted"`, InsertText: `A "quoted"`, Kind: model.CompletionItemFunction}})
+	if len(items) != 1 || items[0].TextEdit == nil || items[0].TextEdit.NewText != `A ""quoted""` {
+		t.Fatalf("completion items = %#v", items)
+	}
+}
+
+func completionByLabel(t *testing.T, message protocol.Message, expected string) protocol.CompletionItem {
+	t.Helper()
+	if message.Error != nil {
+		t.Fatalf("completion error = %#v", message.Error)
+	}
+	var completion protocol.CompletionList
+	if err := json.Unmarshal(message.Result, &completion); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	for _, item := range completion.Items {
+		if item.Label == expected {
+			return item
+		}
+	}
+	t.Fatalf("completion does not contain %q: %#v", expected, completion.Items)
+	return protocol.CompletionItem{}
+}
+
+func assertCompletionLabels(t *testing.T, message protocol.Message, expected ...string) {
+	t.Helper()
+	if message.Error != nil {
+		t.Fatalf("completion error = %#v", message.Error)
+	}
+	var completion protocol.CompletionList
+	if err := json.Unmarshal(message.Result, &completion); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	labels := make(map[string]bool)
+	for _, item := range completion.Items {
+		labels[item.Label] = true
+	}
+	for _, label := range expected {
+		if !labels[label] {
+			t.Fatalf("completion labels %v do not contain %q", labels, label)
+		}
 	}
 }
 

@@ -190,6 +190,213 @@ func (i *Index) References(ctx context.Context, uri string, offset uint, include
 	return i.references(ctx, uri, offset, includeDeclaration, 0, false)
 }
 
+func (i *Index) CompletionsAtRevision(ctx context.Context, uri string, completion model.CompletionContext, revision uint64) ([]model.CompletionItem, bool, error) {
+	canonicalURI, path := canonicalDocumentIdentity(uri)
+	i.mu.RLock()
+	if revision != i.revision {
+		i.mu.RUnlock()
+		return nil, true, nil
+	}
+	canonicalURI = i.uriForPathLocked(canonicalURI, path)
+	snapshot := i.snapshotLocked()
+	i.mu.RUnlock()
+
+	source, ok := snapshot.documentLocked(canonicalURI)
+	if !ok {
+		return nil, false, nil
+	}
+	items := make(map[string]model.CompletionItem)
+	add := func(item model.CompletionItem) {
+		if !strings.HasPrefix(strings.ToLower(item.Label), strings.ToLower(completion.Prefix)) {
+			return
+		}
+		key := strings.ToLower(item.Label)
+		if _, exists := items[key]; !exists {
+			items[key] = item
+		}
+	}
+
+	if completion.Kind == model.CompletionExpression || completion.Kind == model.CompletionStatement {
+		visible := make(map[string]model.Definition)
+		depths := make(map[string]int)
+		for _, definition := range source.Analysis.Definitions {
+			if err := ctx.Err(); err != nil {
+				return nil, false, err
+			}
+			if definition.Kind != model.DefinitionVariable || !completionVisible(completion, definition) {
+				continue
+			}
+			key := strings.ToLower(definition.Name)
+			depth := commonScopeDepth(completion.Scope, definition.Scope)
+			if currentDepth, exists := depths[key]; !exists || depth > currentDepth {
+				visible[key], depths[key] = definition, depth
+			}
+		}
+		for _, definition := range visible {
+			add(model.CompletionItem{Label: definition.Name, InsertText: definition.Name, Detail: "local variable", Kind: model.CompletionItemVariable})
+		}
+	}
+
+	switch completion.Kind {
+	case model.CompletionTarget:
+		if err := snapshot.addTargetCompletions(ctx, source, completion, add); err != nil {
+			return nil, false, err
+		}
+	case model.CompletionFilename:
+		for _, document := range snapshot.documentsLocked() {
+			if err := ctx.Err(); err != nil {
+				return nil, false, err
+			}
+			label := completionFilename(source.Path, document.Path)
+			add(model.CompletionItem{Label: label, InsertText: label, Detail: "Run MyScreens file", Kind: model.CompletionItemFile})
+		}
+	}
+
+	result := make([]model.CompletionItem, 0, len(items))
+	for _, item := range items {
+		result = append(result, item)
+	}
+	sort.Slice(result, func(left, right int) bool {
+		return strings.ToLower(result[left].Label) < strings.ToLower(result[right].Label)
+	})
+	i.mu.RLock()
+	stale := revision != i.revision
+	i.mu.RUnlock()
+	if stale {
+		return nil, true, nil
+	}
+	return result, false, nil
+}
+
+func (i *Index) addTargetCompletions(ctx context.Context, source Document, completion model.CompletionContext, add func(model.CompletionItem)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if completion.TargetKind == model.DefinitionSubprogram || completion.TargetKind == model.DefinitionOutput {
+		for _, definition := range source.Analysis.Definitions {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if definition.Kind == completion.TargetKind && completionSameOwner(completion, definition.Scope, definition.Range.Start) {
+				add(completionForDefinition(definition))
+			}
+		}
+		for _, load := range source.Analysis.References {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if load.Kind != model.DefinitionBlock || load.TargetFile == "" || !completionSameOwner(completion, load.Scope, load.Range.Start) {
+				continue
+			}
+			block, ok := i.resolveLocked(source.URI, load)
+			if !ok {
+				continue
+			}
+			document, ok := i.documentLocked(block.URI)
+			if !ok {
+				continue
+			}
+			for _, definition := range document.Analysis.Definitions {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if definition.Kind == completion.TargetKind && scopeContains(definition.Scope, block.DefinitionRange) {
+					add(completionForDefinition(definition))
+				}
+			}
+		}
+		return nil
+	}
+	if completion.TargetKind == model.DefinitionGrid {
+		for _, definition := range source.Analysis.Definitions {
+			if definition.Kind == model.DefinitionGrid {
+				add(completionForDefinition(definition))
+			}
+		}
+		return ctx.Err()
+	}
+	for _, document := range i.documentsLocked() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for _, definition := range document.Analysis.Definitions {
+			if definition.Kind == completion.TargetKind {
+				add(completionForDefinition(definition))
+			}
+		}
+	}
+	return nil
+}
+
+func completionVisible(completion model.CompletionContext, definition model.Definition) bool {
+	if visibleFrom(model.Reference{Scope: completion.Scope}, definition) {
+		return true
+	}
+	if len(definition.Scope) > 0 {
+		return false
+	}
+	return completionSameOwner(completion, definition.Scope, definition.Range.Start)
+}
+
+func completionSameOwner(completion model.CompletionContext, scope []model.ByteRange, position uint) bool {
+	if sameOwningEntity(scope, completion.Scope) {
+		return true
+	}
+	if !completion.HasOwner {
+		return false
+	}
+	if len(scope) > 0 {
+		return scope[0].Start == completion.OwnerStart
+	}
+	for _, completionScope := range completion.Scope {
+		if completionScope.Start == completion.OwnerStart {
+			return position >= completionScope.Start && position < completionScope.End
+		}
+	}
+	return position >= completion.OwnerStart
+}
+
+func completionFilename(sourcePath, targetPath string) string {
+	if sourcePath != "" {
+		if relative, err := filepath.Rel(filepath.Dir(sourcePath), targetPath); err == nil && relative != "." {
+			return filepath.ToSlash(relative)
+		}
+	}
+	return filepath.Base(targetPath)
+}
+
+func completionForDefinition(definition model.Definition) model.CompletionItem {
+	item := model.CompletionItem{Label: definition.Name, InsertText: definition.Name, Detail: definitionKindDetail(definition.Kind), Kind: model.CompletionItemModule}
+	switch definition.Kind {
+	case model.DefinitionSubprogram:
+		item.Kind = model.CompletionItemFunction
+	case model.DefinitionOutput:
+		item.Kind = model.CompletionItemMethod
+	}
+	return item
+}
+
+func definitionKindDetail(kind model.DefinitionKind) string {
+	switch kind {
+	case model.DefinitionDialog:
+		return "dialog"
+	case model.DefinitionSoftkeyMenu:
+		return "softkey menu"
+	case model.DefinitionArray:
+		return "array"
+	case model.DefinitionBlock:
+		return "reusable block"
+	case model.DefinitionGrid:
+		return "grid"
+	case model.DefinitionSubprogram:
+		return "subprogram"
+	case model.DefinitionOutput:
+		return "output"
+	default:
+		return "symbol"
+	}
+}
+
 func (i *Index) ReferencesAtRevision(ctx context.Context, uri string, offset uint, includeDeclaration bool, revision uint64) ([]Location, bool, bool, error) {
 	locations, found, err := i.references(ctx, uri, offset, includeDeclaration, revision, true)
 	if errors.Is(err, errStaleRevision) {

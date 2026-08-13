@@ -112,6 +112,29 @@ type ReferenceParams struct {
 	Context      ReferenceContext       `json:"context"`
 }
 
+type CompletionParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+}
+
+type CompletionList struct {
+	IsIncomplete bool             `json:"isIncomplete"`
+	Items        []CompletionItem `json:"items"`
+}
+
+type TextEdit struct {
+	Range   Range  `json:"range"`
+	NewText string `json:"newText"`
+}
+
+type CompletionItem struct {
+	Label      string    `json:"label"`
+	Kind       int       `json:"kind,omitempty"`
+	Detail     string    `json:"detail,omitempty"`
+	InsertText string    `json:"insertText,omitempty"`
+	TextEdit   *TextEdit `json:"textEdit,omitempty"`
+}
+
 type Location struct {
 	URI   string `json:"uri"`
 	Range Range  `json:"range"`
@@ -158,6 +181,11 @@ type ServerCapabilities struct {
 	FoldingRangeProvider   bool                    `json:"foldingRangeProvider"`
 	DefinitionProvider     bool                    `json:"definitionProvider"`
 	ReferencesProvider     bool                    `json:"referencesProvider"`
+	CompletionProvider     *CompletionOptions      `json:"completionProvider,omitempty"`
+}
+
+type CompletionOptions struct {
+	ResolveProvider bool `json:"resolveProvider"`
 }
 
 type TextDocumentSyncOptions struct {

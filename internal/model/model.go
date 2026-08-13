@@ -79,6 +79,47 @@ type Reference struct {
 	FileRange  ByteRange
 }
 
+type CompletionContextKind uint8
+
+const (
+	CompletionUnknown CompletionContextKind = iota
+	CompletionStatement
+	CompletionExpression
+	CompletionTarget
+	CompletionFilename
+)
+
+type CompletionContext struct {
+	Kind                CompletionContextKind
+	Prefix              string
+	ReplaceRange        ByteRange
+	Quoted              bool
+	OwnerStart          uint
+	HasOwner            bool
+	Scope               []ByteRange
+	TargetKind          DefinitionKind
+	ExpectedTerminators []string
+}
+
+type CompletionItemKind uint8
+
+const (
+	CompletionItemUnknown CompletionItemKind = iota
+	CompletionItemKeyword
+	CompletionItemVariable
+	CompletionItemFunction
+	CompletionItemMethod
+	CompletionItemModule
+	CompletionItemFile
+)
+
+type CompletionItem struct {
+	Label      string
+	InsertText string
+	Detail     string
+	Kind       CompletionItemKind
+}
+
 type Analysis struct {
 	Diagnostics []Diagnostic
 	Symbols     []Symbol

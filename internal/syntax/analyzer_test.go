@@ -2,6 +2,7 @@ package syntax
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/LehMichael/run-myscreens-lsp/internal/model"
@@ -169,6 +170,165 @@ func TestAnalyzeLowersAllTopLevelDefinitionKinds(t *testing.T) {
 		if got.Name != expected.name || got.Kind != expected.kind {
 			t.Errorf("definition %d = %#v, want name=%q kind=%d", index, got, expected.name, expected.kind)
 		}
+	}
+}
+
+func TestCompletionContextClassifiesTargetsFilesAndStatements(t *testing.T) {
+	analyzer := NewTreeSitterAnalyzer()
+	tests := []struct {
+		name       string
+		source     string
+		kind       model.CompletionContextKind
+		prefix     string
+		targetKind model.DefinitionKind
+	}{
+		{"call target", "//M(Main)\nLOAD\n  CALL(\"Up", model.CompletionTarget, "Up", model.DefinitionSubprogram},
+		{"output target", "//M(Main)\nLOAD\n  GC(\"Co", model.CompletionTarget, "Co", model.DefinitionOutput},
+		{"entity target", "//M(Main)\nLOAD\n  LM(\"Ma", model.CompletionTarget, "Ma", model.DefinitionDialog},
+		{"filename", "//M(Main)\nLOAD\n  LS(\"Menu\", \"sha", model.CompletionFilename, "sha", model.DefinitionUnknown},
+		{"grid remains target", "//M(Main)\nLOAD\n  LG(\"Gr", model.CompletionTarget, "Gr", model.DefinitionGrid},
+		{"statement", "//M(Main)\nLOAD\n  CA", model.CompletionStatement, "CA", model.DefinitionUnknown},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			completion, err := analyzer.CompletionContext(context.Background(), []byte(test.source), uint(len(test.source)))
+			if err != nil {
+				t.Fatalf("CompletionContext: %v", err)
+			}
+			if completion.Kind != test.kind || completion.Prefix != test.prefix || completion.TargetKind != test.targetKind {
+				t.Fatalf("completion = %#v", completion)
+			}
+		})
+	}
+}
+
+func TestCompletionContextRejectsCommentsStringsAndMemberCalls(t *testing.T) {
+	analyzer := NewTreeSitterAnalyzer()
+	for _, source := range []string{
+		"//M(Main)\nLOAD\n  ; CALL(\"Wo",
+		"//M(Main)\nLOAD\n  object.CALL(\"Wo",
+		"//M(Main)\nLOAD\n  value=\"prefix CALL(\"Wo",
+	} {
+		completion, err := analyzer.CompletionContext(context.Background(), []byte(source), uint(len(source)))
+		if err != nil {
+			t.Fatalf("CompletionContext: %v", err)
+		}
+		if completion.Kind == model.CompletionTarget || completion.Kind == model.CompletionFilename {
+			t.Errorf("source %q misclassified as %#v", source, completion)
+		}
+	}
+}
+
+func TestCompletionContextRecoversMalformedEOFStructure(t *testing.T) {
+	source := "//M(Main)\nLOAD\n  CALL(\"Wo"
+	completion, err := NewTreeSitterAnalyzer().CompletionContext(context.Background(), []byte(source), uint(len(source)))
+	if err != nil {
+		t.Fatalf("CompletionContext: %v", err)
+	}
+	if completion.Kind != model.CompletionTarget || len(completion.Scope) < 2 {
+		t.Fatalf("completion = %#v", completion)
+	}
+	want := map[string]bool{"END_LOAD": true, "//END": true}
+	for _, terminator := range completion.ExpectedTerminators {
+		delete(want, terminator)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing terminators %v from %#v", want, completion.ExpectedTerminators)
+	}
+}
+
+func TestCompletionContextRecoversBOMAndNearestIncompleteOwner(t *testing.T) {
+	tests := []struct {
+		name       string
+		source     string
+		ownerStart uint
+	}{
+		{"bom", "\uFEFF//M(Main)\nSUB(Work)\nEND_SUB\nLOAD\n  CALL(\"Wo", uint(len("\uFEFF"))},
+		{"nearest", "//M(First)\nSUB(Wrong)\nEND_SUB\n//M(Second)\nSUB(Work)\nEND_SUB\nLOAD\n  CALL(\"Wo", uint(len("//M(First)\nSUB(Wrong)\nEND_SUB\n"))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			completion, err := NewTreeSitterAnalyzer().CompletionContext(context.Background(), []byte(test.source), uint(len(test.source)))
+			if err != nil {
+				t.Fatalf("CompletionContext: %v", err)
+			}
+			if !completion.HasOwner || completion.OwnerStart != test.ownerStart {
+				t.Fatalf("completion = %#v", completion)
+			}
+		})
+	}
+}
+
+func TestCompletionContextReplacesQuotedPrefixAndDoubledQuote(t *testing.T) {
+	source := []byte("//M(Main)\nLOAD\n  LM(\"A \"\"quoted\"\" na\")\nEND_LOAD\n//END\n")
+	offset := uint(strings.Index(string(source), `na"`) + len("na"))
+	completion, err := NewTreeSitterAnalyzer().CompletionContext(context.Background(), source, offset)
+	if err != nil {
+		t.Fatalf("CompletionContext: %v", err)
+	}
+	if !completion.Quoted || completion.Prefix != `A "quoted" na` || string(source[completion.ReplaceRange.Start:completion.ReplaceRange.End]) != `A ""quoted"" na` {
+		t.Fatalf("completion = %#v, replacement = %q", completion, source[completion.ReplaceRange.Start:completion.ReplaceRange.End])
+	}
+	insideEscape := uint(strings.Index(string(source), `""quoted`) + 1)
+	completion, err = NewTreeSitterAnalyzer().CompletionContext(context.Background(), source, insideEscape)
+	if err != nil {
+		t.Fatalf("CompletionContext inside escape: %v", err)
+	}
+	if completion.Kind != model.CompletionTarget || completion.ReplaceRange.Start >= insideEscape || completion.ReplaceRange.End <= insideEscape+1 {
+		t.Fatalf("inside escape completion = %#v", completion)
+	}
+}
+
+func TestCompletionContextIncludesScopeAndExpectedTerminators(t *testing.T) {
+	source := "//M(Main)\nLOAD\n  IF value==1\n    \n  ENDIF\nEND_LOAD\n//END\n"
+	offset := uint(len("//M(Main)\nLOAD\n  IF value==1\n    "))
+	completion, err := NewTreeSitterAnalyzer().CompletionContext(context.Background(), []byte(source), offset)
+	if err != nil {
+		t.Fatalf("CompletionContext: %v", err)
+	}
+	if completion.Kind != model.CompletionStatement || len(completion.Scope) != 2 {
+		t.Fatalf("completion = %#v", completion)
+	}
+	wantTerminators := map[string]bool{"ENDIF": true, "END_LOAD": true, "//END": true}
+	for _, terminator := range completion.ExpectedTerminators {
+		delete(wantTerminators, terminator)
+	}
+	if len(wantTerminators) != 0 {
+		t.Fatalf("missing terminators %v from %#v", wantTerminators, completion.ExpectedTerminators)
+	}
+}
+
+func TestLexicalRecoveryHandlesCommentedEndStartSoftkeyAndPostLoop(t *testing.T) {
+	source := []byte("//S(Menu)\nPRESS(HS9)\n  \nEND_PRESS\n//END ; comment\n//M(Next)\nDO\nLOOP_UNTIL TRUE\n  ")
+	completion, err := NewTreeSitterAnalyzer().CompletionContext(context.Background(), source, uint(len(source)))
+	if err != nil {
+		t.Fatalf("CompletionContext: %v", err)
+	}
+	if !completion.HasOwner || completion.OwnerStart != uint(strings.Index(string(source), "//M(Next)")) {
+		t.Fatalf("owner = %#v", completion)
+	}
+	for _, terminator := range completion.ExpectedTerminators {
+		if terminator == "END_PRESS" || terminator == "LOOP_WHILE" || terminator == "LOOP_UNTIL" {
+			t.Fatalf("stale terminator %q in %#v", terminator, completion.ExpectedTerminators)
+		}
+	}
+}
+
+func TestExpectedTerminatorsCoverEventsAndLoopShapes(t *testing.T) {
+	want := map[string]string{
+		"unload_event": "END_UNLOAD", "change_event": "END_CHANGE", "focus_event": "END_FOCUS",
+		"accesslevel_event": "END_ACCESSLEVEL", "channel_event": "END_CHANNEL", "control_event": "END_CONTROL",
+		"language_event": "END_LANGUAGE", "resolution_event": "END_RESOLUTION", "suspend_event": "END_SUSPEND",
+		"resume_event": "END_RESUME", "pre_test_loop": "LOOP",
+	}
+	for kind, terminator := range want {
+		if got := expectedTerminator(kind); got != terminator {
+			t.Errorf("expectedTerminator(%q) = %q, want %q", kind, got, terminator)
+		}
+	}
+	post := expectedTerminators("post_test_loop")
+	if len(post) != 2 || post[0] != "LOOP_WHILE" || post[1] != "LOOP_UNTIL" {
+		t.Fatalf("post-test terminators = %#v", post)
 	}
 }
 

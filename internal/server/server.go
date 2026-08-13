@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/LehMichael/run-myscreens-lsp/internal/document"
@@ -85,7 +87,7 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) isConcurrentRequest(message protocol.Message) bool {
-	return s.initialized && !s.shutdown && len(message.ID) > 0 && message.Method == "textDocument/references"
+	return s.initialized && !s.shutdown && len(message.ID) > 0 && (message.Method == "textDocument/references" || message.Method == "textDocument/completion")
 }
 
 func (s *Server) startRequest(parent context.Context, message protocol.Message) {
@@ -181,6 +183,7 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 				FoldingRangeProvider:   true,
 				DefinitionProvider:     true,
 				ReferencesProvider:     true,
+				CompletionProvider:     &protocol.CompletionOptions{},
 			},
 			ServerInfo: protocol.ServerInfo{Name: serverName, Version: serverVersion},
 		})
@@ -257,6 +260,16 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 			return err
 		}
 		return s.connection.Reply(message.ID, locations)
+	case "textDocument/completion":
+		var params protocol.CompletionParams
+		if err := json.Unmarshal(message.Params, &params); err != nil {
+			return fmt.Errorf("decode completion params: %w", err)
+		}
+		completion, err := s.completion(ctx, params)
+		if err != nil {
+			return err
+		}
+		return s.connection.Reply(message.ID, completion)
 	case "textDocument/foldingRange":
 		var params protocol.FoldingRangeParams
 		if err := json.Unmarshal(message.Params, &params); err != nil {
@@ -359,6 +372,112 @@ func (s *Server) references(ctx context.Context, params protocol.ReferenceParams
 		return result, nil
 	}
 	return []protocol.Location{}, nil
+}
+
+func (s *Server) completion(ctx context.Context, params protocol.CompletionParams) (protocol.CompletionList, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return protocol.CompletionList{}, err
+		}
+		indexed, revision, ok := s.workspace.DocumentSnapshot(params.TextDocument.URI)
+		if !ok {
+			return protocol.CompletionList{Items: []protocol.CompletionItem{}}, nil
+		}
+		doc := document.New(indexed.URI, "run-myscreens", 0, indexed.Text)
+		offset, ok := doc.ByteOffsetAt(params.Position)
+		if !ok {
+			return protocol.CompletionList{Items: []protocol.CompletionItem{}}, nil
+		}
+		completionContext, err := s.analyzer.CompletionContext(ctx, []byte(indexed.Text), offset)
+		if err != nil {
+			return protocol.CompletionList{}, err
+		}
+		semantic, stale, err := s.workspace.CompletionsAtRevision(ctx, indexed.URI, completionContext, revision)
+		if err != nil {
+			return protocol.CompletionList{}, err
+		}
+		if stale {
+			continue
+		}
+		items := completionItems(doc, completionContext, semantic)
+		return protocol.CompletionList{Items: items}, nil
+	}
+	return protocol.CompletionList{IsIncomplete: true, Items: []protocol.CompletionItem{}}, nil
+}
+
+func completionItems(doc *document.Document, completionContext model.CompletionContext, semantic []model.CompletionItem) []protocol.CompletionItem {
+	items := make(map[string]protocol.CompletionItem)
+	replaceRange := doc.Range(completionContext.ReplaceRange.Start, completionContext.ReplaceRange.End)
+	add := func(item protocol.CompletionItem) {
+		if !strings.HasPrefix(strings.ToLower(item.Label), strings.ToLower(completionContext.Prefix)) {
+			return
+		}
+		key := strings.ToLower(item.Label)
+		if _, exists := items[key]; !exists {
+			items[key] = item
+		}
+	}
+	if completionContext.Kind == model.CompletionStatement {
+		for _, keyword := range statementKeywords {
+			add(completionProtocolItem(keyword, keyword, 14, "keyword", replaceRange))
+		}
+		for _, terminator := range completionContext.ExpectedTerminators {
+			add(completionProtocolItem(terminator, terminator, 14, "expected terminator", replaceRange))
+		}
+	}
+	for _, item := range semantic {
+		insertText := item.InsertText
+		if insertText == "" {
+			insertText = item.Label
+		}
+		if completionContext.Quoted {
+			insertText = strings.ReplaceAll(insertText, `"`, `""`)
+		}
+		add(completionProtocolItem(item.Label, insertText, lspCompletionKind(item.Kind), item.Detail, replaceRange))
+	}
+	result := make([]protocol.CompletionItem, 0, len(items))
+	for _, item := range items {
+		result = append(result, item)
+	}
+	sort.Slice(result, func(left, right int) bool {
+		return strings.ToLower(result[left].Label) < strings.ToLower(result[right].Label)
+	})
+	return result
+}
+
+func completionProtocolItem(label, insertText string, kind int, detail string, replaceRange protocol.Range) protocol.CompletionItem {
+	return protocol.CompletionItem{
+		Label:      label,
+		InsertText: insertText,
+		Kind:       kind,
+		Detail:     detail,
+		TextEdit:   &protocol.TextEdit{Range: replaceRange, NewText: insertText},
+	}
+}
+
+var statementKeywords = []string{
+	"ACCESSLEVEL", "CALL", "CASE", "CHANNEL", "CHANGE", "CLEAR_BACKGROUND", "CONTROL", "DEFAULT", "DEF", "DO", "DO_UNTIL", "DO_WHILE",
+	"EXIT", "FOCUS", "GC", "IF", "LA", "LANGUAGE", "LB", "LG", "LM", "LOAD", "LOOP_UNTIL", "LOOP_WHILE", "LS", "OUTPUT", "PRESS", "RESOLUTION", "RESUME", "RETURN",
+	"SUB", "SUSPEND", "SWITCH", "UNLOAD",
+}
+
+func lspCompletionKind(kind model.CompletionItemKind) int {
+	switch kind {
+	case model.CompletionItemKeyword:
+		return 14
+	case model.CompletionItemVariable:
+		return 6
+	case model.CompletionItemFunction:
+		return 3
+	case model.CompletionItemMethod:
+		return 2
+	case model.CompletionItemModule:
+		return 9
+	case model.CompletionItemFile:
+		return 17
+	default:
+		return 1
+	}
 }
 
 func referenceAt(references []model.Reference, offset uint) (model.Reference, bool) {

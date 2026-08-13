@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/LehMichael/run-myscreens-lsp/internal/model"
@@ -378,6 +379,199 @@ func TestReferencesHonorCancellation(t *testing.T) {
 	locations, found, err := index.References(ctx, uri, 1, false)
 	if err != context.Canceled || found || locations != nil {
 		t.Fatalf("canceled references = %#v, %v, %v", locations, found, err)
+	}
+}
+
+func TestCompletionsIncludeVisibleLocalsAndLoadedTargets(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	blocksURI := "file:///workspace/blocks.com"
+	dialog := model.ByteRange{Start: 0, End: 100}
+	event := model.ByteRange{Start: 10, End: 90}
+	block := model.ByteRange{Start: 0, End: 50}
+	index := New()
+	index.Overlay(uri, "source", model.Analysis{
+		Definitions: []model.Definition{
+			{Name: "Value", Kind: model.DefinitionVariable, Scope: []model.ByteRange{dialog}},
+			{Name: "value", Kind: model.DefinitionVariable, Scope: []model.ByteRange{dialog, event}},
+			{Name: "EventOnly", Kind: model.DefinitionVariable, Scope: []model.ByteRange{dialog, event}},
+			{Name: "Code", Kind: model.DefinitionOutput, Scope: []model.ByteRange{dialog}},
+		},
+		References: []model.Reference{{Name: "Helpers", Kind: model.DefinitionBlock, TargetFile: "blocks.com", Scope: []model.ByteRange{dialog, event}}},
+	})
+	index.Overlay(blocksURI, "blocks", model.Analysis{Definitions: []model.Definition{
+		{Name: "Helpers", Kind: model.DefinitionBlock, Range: block, SelectionRange: model.ByteRange{Start: 1, End: 8}},
+		{Name: "Work", Kind: model.DefinitionSubprogram, Scope: []model.ByteRange{block}},
+	}})
+	_, revision, _ := index.DocumentSnapshot(uri)
+	items, stale, err := index.CompletionsAtRevision(context.Background(), uri, model.CompletionContext{Kind: model.CompletionExpression, Prefix: "v", Scope: []model.ByteRange{dialog, event}}, revision)
+	if err != nil || stale || len(items) != 1 || items[0].Label != "value" {
+		t.Fatalf("local completions = %#v, %v, %v", items, stale, err)
+	}
+	items, stale, err = index.CompletionsAtRevision(context.Background(), uri, model.CompletionContext{Kind: model.CompletionTarget, TargetKind: model.DefinitionSubprogram, Prefix: "wo", Scope: []model.ByteRange{dialog, event}}, revision)
+	if err != nil || stale || len(items) != 1 || items[0].Label != "Work" || items[0].Kind != model.CompletionItemFunction {
+		t.Fatalf("CALL completions = %#v, %v, %v", items, stale, err)
+	}
+	items, stale, err = index.CompletionsAtRevision(context.Background(), uri, model.CompletionContext{Kind: model.CompletionTarget, TargetKind: model.DefinitionOutput, Prefix: "co", Scope: []model.ByteRange{dialog, event}}, revision)
+	if err != nil || stale || len(items) != 1 || items[0].Label != "Code" || items[0].Kind != model.CompletionItemMethod {
+		t.Fatalf("GC completions = %#v, %v, %v", items, stale, err)
+	}
+}
+
+func TestLocalCompletionDoesNotLeakAcrossSiblingEvents(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	dialog := model.ByteRange{Start: 0, End: 100}
+	press := model.ByteRange{Start: 10, End: 40}
+	load := model.ByteRange{Start: 40, End: 90}
+	index := New()
+	index.Overlay(uri, "source", model.Analysis{Definitions: []model.Definition{
+		{Name: "hidden", Kind: model.DefinitionVariable, Range: model.ByteRange{Start: 20, End: 26}, Scope: []model.ByteRange{dialog, press}},
+	}})
+	_, revision, _ := index.DocumentSnapshot(uri)
+	completion := model.CompletionContext{Kind: model.CompletionExpression, Prefix: "hi", HasOwner: true, OwnerStart: 0, Scope: []model.ByteRange{dialog, load}}
+	items, stale, err := index.CompletionsAtRevision(context.Background(), uri, completion, revision)
+	if err != nil || stale || len(items) != 0 {
+		t.Fatalf("sibling-event locals = %#v, %v, %v", items, stale, err)
+	}
+}
+
+func TestCompletionsUseRecoveredOwnerForMalformedAnalysis(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	index := New()
+	index.Overlay(uri, "source", model.Analysis{Definitions: []model.Definition{{Name: "Work", Kind: model.DefinitionSubprogram, Range: model.ByteRange{Start: 10, End: 20}}}})
+	_, revision, _ := index.DocumentSnapshot(uri)
+	completion := model.CompletionContext{
+		Kind: model.CompletionTarget, TargetKind: model.DefinitionSubprogram, Prefix: "Wo",
+		HasOwner: true, OwnerStart: 0, Scope: []model.ByteRange{{Start: 0, End: 100}},
+	}
+	items, stale, err := index.CompletionsAtRevision(context.Background(), uri, completion, revision)
+	if err != nil || stale || len(items) != 1 || items[0].Label != "Work" {
+		t.Fatalf("recovered owner completions = %#v, %v, %v", items, stale, err)
+	}
+}
+
+func TestCompletionCandidatesInValidBOMSource(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	text := "\uFEFF//M(Main)\nSUB(Work)\nEND_SUB\nLOAD\n  CALL(\"Wo\")\nEND_LOAD\n//END\n"
+	analyzer := syntax.NewTreeSitterAnalyzer()
+	analysis, err := analyzer.Analyze(context.Background(), []byte(text))
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	offset := uint(strings.Index(text, `Wo"`) + len("Wo"))
+	completion, err := analyzer.CompletionContext(context.Background(), []byte(text), offset)
+	if err != nil {
+		t.Fatalf("CompletionContext: %v", err)
+	}
+	index := New()
+	index.Overlay(uri, text, analysis)
+	_, revision, _ := index.DocumentSnapshot(uri)
+	items, stale, err := index.CompletionsAtRevision(context.Background(), uri, completion, revision)
+	if err != nil || stale || len(items) != 1 || items[0].Label != "Work" {
+		t.Fatalf("BOM completions = %#v, %v, %v; context=%#v", items, stale, err, completion)
+	}
+}
+
+func TestCompletionsIncludeEntitiesAndDeduplicatedFiles(t *testing.T) {
+	root := t.TempDir()
+	mainPath := filepath.Join(root, "Main.com")
+	writeTestFile(t, mainPath, "//M(Main)\n//END\n")
+	sharedPath := filepath.Join(root, "Shared.com")
+	writeTestFile(t, sharedPath, "//M(SharedMask)\n//END\n")
+	subdir := filepath.Join(root, "sub")
+	if err := os.MkdirAll(subdir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeTestFile(t, filepath.Join(subdir, "shared.com"), "//M(Other)\n//END\n")
+	index := New()
+	if err := index.Load(context.Background(), []string{FileURI(root)}, syntax.NewTreeSitterAnalyzer()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	uri := FileURI(mainPath)
+	_, revision, _ := index.DocumentSnapshot(uri)
+	items, stale, err := index.CompletionsAtRevision(context.Background(), uri, model.CompletionContext{Kind: model.CompletionTarget, TargetKind: model.DefinitionDialog, Prefix: "shared"}, revision)
+	if err != nil || stale || len(items) != 1 || items[0].Label != "SharedMask" {
+		t.Fatalf("entity completions = %#v, %v, %v", items, stale, err)
+	}
+	items, stale, err = index.CompletionsAtRevision(context.Background(), uri, model.CompletionContext{Kind: model.CompletionFilename, Prefix: ""}, revision)
+	if err != nil || stale {
+		t.Fatalf("filename completions = %#v, %v, %v", items, stale, err)
+	}
+	labels := make(map[string]bool)
+	for _, item := range items {
+		labels[item.Label] = true
+	}
+	if !labels["Shared.com"] || !labels["sub/shared.com"] {
+		t.Fatalf("filename labels = %v", labels)
+	}
+	_ = sharedPath
+}
+
+func TestGridCompletionStaysInSameFile(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	otherURI := "file:///workspace/other.com"
+	index := New()
+	index.Overlay(uri, "source", model.Analysis{Definitions: []model.Definition{{Name: "LocalGrid", Kind: model.DefinitionGrid}}})
+	index.Overlay(otherURI, "other", model.Analysis{Definitions: []model.Definition{{Name: "RemoteGrid", Kind: model.DefinitionGrid}}})
+	_, revision, _ := index.DocumentSnapshot(uri)
+	items, stale, err := index.CompletionsAtRevision(context.Background(), uri, model.CompletionContext{Kind: model.CompletionTarget, TargetKind: model.DefinitionGrid}, revision)
+	if err != nil || stale || len(items) != 1 || items[0].Label != "LocalGrid" {
+		t.Fatalf("grid completions = %#v, %v, %v", items, stale, err)
+	}
+}
+
+func TestCompletionsUseOverlayAndRejectStaleRevision(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	index := New()
+	index.Overlay(uri, "old", model.Analysis{Definitions: []model.Definition{{Name: "Old", Kind: model.DefinitionDialog}}})
+	_, revision, _ := index.DocumentSnapshot(uri)
+	index.Overlay(uri, "new", model.Analysis{Definitions: []model.Definition{{Name: "New", Kind: model.DefinitionDialog}}})
+	items, stale, err := index.CompletionsAtRevision(context.Background(), uri, model.CompletionContext{Kind: model.CompletionTarget, TargetKind: model.DefinitionDialog}, revision)
+	if err != nil || !stale || items != nil {
+		t.Fatalf("stale completions = %#v, %v, %v", items, stale, err)
+	}
+	_, revision, _ = index.DocumentSnapshot(uri)
+	items, stale, err = index.CompletionsAtRevision(context.Background(), uri, model.CompletionContext{Kind: model.CompletionTarget, TargetKind: model.DefinitionDialog}, revision)
+	if err != nil || stale || len(items) != 1 || items[0].Label != "New" {
+		t.Fatalf("overlay completions = %#v, %v, %v", items, stale, err)
+	}
+}
+
+func TestCallCompletionsHonorCancellation(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	index := New()
+	index.Overlay(uri, "source", model.Analysis{})
+	_, revision, _ := index.DocumentSnapshot(uri)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	items, stale, err := index.CompletionsAtRevision(ctx, uri, model.CompletionContext{Kind: model.CompletionTarget, TargetKind: model.DefinitionSubprogram}, revision)
+	if err != context.Canceled || stale || items != nil {
+		t.Fatalf("canceled CALL completions = %#v, %v, %v", items, stale, err)
+	}
+}
+
+func TestTargetCompletionsHonorCancellation(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	index := New()
+	index.Overlay(uri, "source", model.Analysis{})
+	_, revision, _ := index.DocumentSnapshot(uri)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	items, stale, err := index.CompletionsAtRevision(ctx, uri, model.CompletionContext{Kind: model.CompletionTarget, TargetKind: model.DefinitionDialog}, revision)
+	if err != context.Canceled || stale || items != nil {
+		t.Fatalf("canceled target completions = %#v, %v, %v", items, stale, err)
+	}
+}
+
+func TestCompletionsHonorCancellation(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	index := New()
+	index.Overlay(uri, "source", model.Analysis{})
+	_, revision, _ := index.DocumentSnapshot(uri)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	items, stale, err := index.CompletionsAtRevision(ctx, uri, model.CompletionContext{Kind: model.CompletionFilename}, revision)
+	if err != context.Canceled || stale || items != nil {
+		t.Fatalf("canceled completions = %#v, %v, %v", items, stale, err)
 	}
 }
 
