@@ -87,7 +87,7 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) isConcurrentRequest(message protocol.Message) bool {
-	return s.initialized && !s.shutdown && len(message.ID) > 0 && (message.Method == "textDocument/references" || message.Method == "textDocument/completion")
+	return s.initialized && !s.shutdown && len(message.ID) > 0 && (message.Method == "textDocument/references" || message.Method == "textDocument/completion" || message.Method == "textDocument/hover")
 }
 
 func (s *Server) startRequest(parent context.Context, message protocol.Message) {
@@ -183,6 +183,7 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 				FoldingRangeProvider:   true,
 				DefinitionProvider:     true,
 				ReferencesProvider:     true,
+				HoverProvider:          true,
 				CompletionProvider:     &protocol.CompletionOptions{},
 			},
 			ServerInfo: protocol.ServerInfo{Name: serverName, Version: serverVersion},
@@ -227,9 +228,12 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 		if err := s.workspace.RemoveOverlay(ctx, params.TextDocument.URI, s.analyzer); err != nil {
 			return err
 		}
-		return s.connection.Notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{
+		if err := s.connection.Notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{
 			URI: params.TextDocument.URI, Diagnostics: []protocol.Diagnostic{},
-		})
+		}); err != nil {
+			return err
+		}
+		return s.publishOpenDiagnostics(ctx)
 	case "textDocument/documentSymbol":
 		var params protocol.DocumentSymbolParams
 		if err := json.Unmarshal(message.Params, &params); err != nil {
@@ -270,6 +274,16 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 			return err
 		}
 		return s.connection.Reply(message.ID, completion)
+	case "textDocument/hover":
+		var params protocol.TextDocumentPositionParams
+		if err := json.Unmarshal(message.Params, &params); err != nil {
+			return fmt.Errorf("decode hover params: %w", err)
+		}
+		hover, err := s.hover(ctx, params)
+		if err != nil {
+			return err
+		}
+		return s.connection.Reply(message.ID, hover)
 	case "textDocument/foldingRange":
 		var params protocol.FoldingRangeParams
 		if err := json.Unmarshal(message.Params, &params); err != nil {
@@ -298,20 +312,41 @@ func (s *Server) publishDiagnostics(ctx context.Context, doc *document.Document)
 	}
 	doc.Analysis = analysis
 	s.workspace.Overlay(doc.URI, doc.Text, analysis)
-	items := make([]protocol.Diagnostic, 0, len(analysis.Diagnostics))
-	for _, diagnostic := range analysis.Diagnostics {
-		items = append(items, protocol.Diagnostic{
-			Range:    doc.Range(diagnostic.Range.Start, diagnostic.Range.End),
-			Severity: 1,
-			Code:     diagnostic.Code,
-			Source:   serverName,
-			Message:  diagnostic.Message,
-		})
+	return s.publishOpenDiagnostics(ctx)
+}
+
+func (s *Server) publishOpenDiagnostics(ctx context.Context) error {
+	for _, open := range s.documents.All() {
+		indexed, revision, ok := s.workspace.DocumentSnapshot(open.URI)
+		if !ok {
+			continue
+		}
+		semantic, stale, err := s.workspace.SemanticDiagnosticsAtRevision(ctx, indexed.URI, revision)
+		if err != nil {
+			return err
+		}
+		if stale {
+			return s.publishOpenDiagnostics(ctx)
+		}
+		diagnostics := append(append([]model.Diagnostic(nil), open.Analysis.Diagnostics...), semantic...)
+		items := make([]protocol.Diagnostic, 0, len(diagnostics))
+		for _, diagnostic := range diagnostics {
+			items = append(items, protocol.Diagnostic{
+				Range:    open.Range(diagnostic.Range.Start, diagnostic.Range.End),
+				Severity: 1,
+				Code:     diagnostic.Code,
+				Source:   serverName,
+				Message:  diagnostic.Message,
+			})
+		}
+		version := open.Version
+		if err := s.connection.Notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{
+			URI: open.URI, Version: &version, Diagnostics: items,
+		}); err != nil {
+			return err
+		}
 	}
-	version := doc.Version
-	return s.connection.Notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{
-		URI: doc.URI, Version: &version, Diagnostics: items,
-	})
+	return nil
 }
 
 func (s *Server) definition(params protocol.TextDocumentPositionParams) (*protocol.Location, bool) {
@@ -372,6 +407,39 @@ func (s *Server) references(ctx context.Context, params protocol.ReferenceParams
 		return result, nil
 	}
 	return []protocol.Location{}, nil
+}
+
+func (s *Server) hover(ctx context.Context, params protocol.TextDocumentPositionParams) (*protocol.Hover, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		indexed, revision, ok := s.workspace.DocumentSnapshot(params.TextDocument.URI)
+		if !ok {
+			return nil, nil
+		}
+		doc := document.New(indexed.URI, "run-myscreens", 0, indexed.Text)
+		offset, ok := doc.ByteOffsetAt(params.Position)
+		if !ok {
+			return nil, nil
+		}
+		hover, found, stale, err := s.workspace.HoverAtRevision(ctx, indexed.URI, offset, revision)
+		if err != nil {
+			return nil, err
+		}
+		if stale {
+			continue
+		}
+		if !found {
+			return nil, nil
+		}
+		rangeValue := doc.Range(hover.Range.Start, hover.Range.End)
+		return &protocol.Hover{
+			Contents: protocol.MarkupContent{Kind: "markdown", Value: hover.Contents},
+			Range:    &rangeValue,
+		}, nil
+	}
+	return nil, nil
 }
 
 func (s *Server) completion(ctx context.Context, params protocol.CompletionParams) (protocol.CompletionList, error) {

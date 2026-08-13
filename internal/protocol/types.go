@@ -117,6 +117,16 @@ type CompletionParams struct {
 	Position     Position               `json:"position"`
 }
 
+type MarkupContent struct {
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
+}
+
+type Hover struct {
+	Contents MarkupContent `json:"contents"`
+	Range    *Range        `json:"range,omitempty"`
+}
+
 type CompletionList struct {
 	IsIncomplete bool             `json:"isIncomplete"`
 	Items        []CompletionItem `json:"items"`
@@ -181,6 +191,7 @@ type ServerCapabilities struct {
 	FoldingRangeProvider   bool                    `json:"foldingRangeProvider"`
 	DefinitionProvider     bool                    `json:"definitionProvider"`
 	ReferencesProvider     bool                    `json:"referencesProvider"`
+	HoverProvider          bool                    `json:"hoverProvider"`
 	CompletionProvider     *CompletionOptions      `json:"completionProvider,omitempty"`
 }
 

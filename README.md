@@ -23,9 +23,11 @@ Current foundation:
 - `textDocument/references` from declarations or references, with `includeDeclaration`, cross-file overlays, deterministic ordering, and the same conservative ambiguity rules
 - Context-aware `textDocument/completion` for statement keywords/terminators, visible locals, static call/entity targets, and confirmed `.com` filename slots
 - Safe completion text edits for incomplete and quoted source, including doubled-quote escaping and mid-token replacement
-- Diagnostic clearing when a document closes
+- `textDocument/hover` for declarations, references, explicit target files, and a conservative built-in catalog
+- High-confidence semantic diagnostics for exact duplicate `DEF`s, missing explicit `.com` targets/entities, and provably out-of-scope local variables
+- Diagnostic clearing and dependent open-document republishing when overlays change or close
 
-Definition resolution is intentionally conservative: dynamic expressions and ambiguous targets return no result rather than guessing. The grammar dependency is versioned from [`github.com/LehMichael/tree-sitter-run-myscreens`](https://github.com/LehMichael/tree-sitter-run-myscreens).
+Resolution and diagnostics are intentionally conservative: dynamic expressions, ambiguous targets, malformed analyses, arbitrary runtime symbols, and case-only declaration differences do not produce guessed results or hard errors. The grammar dependency is versioned from [`github.com/LehMichael/tree-sitter-run-myscreens`](https://github.com/LehMichael/tree-sitter-run-myscreens).
 
 ## Development
 

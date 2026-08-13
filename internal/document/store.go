@@ -1,6 +1,7 @@
 package document
 
 import (
+	"sort"
 	"sync"
 
 	"github.com/LehMichael/run-myscreens-lsp/internal/model"
@@ -53,6 +54,17 @@ func (s *Store) Get(uri string) (Document, bool) {
 		return Document{}, false
 	}
 	return *document, true
+}
+
+func (s *Store) All() []Document {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	documents := make([]Document, 0, len(s.documents))
+	for _, document := range s.documents {
+		documents = append(documents, *document)
+	}
+	sort.Slice(documents, func(left, right int) bool { return documents[left].URI < documents[right].URI })
+	return documents
 }
 
 func (s *Store) Close(uri string) bool {

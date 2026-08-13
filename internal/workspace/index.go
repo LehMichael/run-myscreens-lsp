@@ -190,6 +190,83 @@ func (i *Index) References(ctx context.Context, uri string, offset uint, include
 	return i.references(ctx, uri, offset, includeDeclaration, 0, false)
 }
 
+func (i *Index) HoverAtRevision(ctx context.Context, uri string, offset uint, revision uint64) (model.Hover, bool, bool, error) {
+	canonicalURI, path := canonicalDocumentIdentity(uri)
+	i.mu.RLock()
+	if revision != i.revision {
+		i.mu.RUnlock()
+		return model.Hover{}, false, true, nil
+	}
+	canonicalURI = i.uriForPathLocked(canonicalURI, path)
+	snapshot := i.snapshotLocked()
+	i.mu.RUnlock()
+
+	source, ok := snapshot.documentLocked(canonicalURI)
+	if !ok {
+		return model.Hover{}, false, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return model.Hover{}, false, false, err
+	}
+	if definition, ok := definitionAt(source.Analysis.Definitions, offset); ok {
+		hover := model.Hover{Range: definition.SelectionRange, Contents: definitionHover(source, definition)}
+		return i.finishHover(revision, hover, true)
+	}
+	if reference, ok := referenceAt(source.Analysis.References, offset); ok {
+		hover := model.Hover{Range: reference.Range, Contents: snapshot.referenceHover(source, reference)}
+		return i.finishHover(revision, hover, true)
+	}
+	if reference, ok := fileReferenceAt(source.Analysis.References, offset); ok {
+		hover := model.Hover{Range: reference.FileRange, Contents: snapshot.fileHover(source, reference)}
+		return i.finishHover(revision, hover, true)
+	}
+	if builtin, ok := builtinAt(source.Analysis.Builtins, offset); ok {
+		if contents := builtinHover(builtin); contents != "" {
+			hover := model.Hover{Range: builtin.Range, Contents: contents}
+			return i.finishHover(revision, hover, true)
+		}
+	}
+	return i.finishHover(revision, model.Hover{}, false)
+}
+
+func (i *Index) finishHover(revision uint64, hover model.Hover, found bool) (model.Hover, bool, bool, error) {
+	i.mu.RLock()
+	stale := revision != i.revision
+	i.mu.RUnlock()
+	if stale {
+		return model.Hover{}, false, true, nil
+	}
+	return hover, found, false, nil
+}
+
+func (i *Index) SemanticDiagnosticsAtRevision(ctx context.Context, uri string, revision uint64) ([]model.Diagnostic, bool, error) {
+	canonicalURI, path := canonicalDocumentIdentity(uri)
+	i.mu.RLock()
+	if revision != i.revision {
+		i.mu.RUnlock()
+		return nil, true, nil
+	}
+	canonicalURI = i.uriForPathLocked(canonicalURI, path)
+	snapshot := i.snapshotLocked()
+	i.mu.RUnlock()
+
+	source, ok := snapshot.documentLocked(canonicalURI)
+	if !ok || !source.Analysis.SemanticComplete {
+		return []model.Diagnostic{}, false, nil
+	}
+	diagnostics, err := snapshot.semanticDiagnostics(ctx, source)
+	if err != nil {
+		return nil, false, err
+	}
+	i.mu.RLock()
+	stale := revision != i.revision
+	i.mu.RUnlock()
+	if stale {
+		return nil, true, nil
+	}
+	return diagnostics, false, nil
+}
+
 func (i *Index) CompletionsAtRevision(ctx context.Context, uri string, completion model.CompletionContext, revision uint64) ([]model.CompletionItem, bool, error) {
 	canonicalURI, path := canonicalDocumentIdentity(uri)
 	i.mu.RLock()
@@ -392,6 +469,10 @@ func definitionKindDetail(kind model.DefinitionKind) string {
 		return "subprogram"
 	case model.DefinitionOutput:
 		return "output"
+	case model.DefinitionVariable:
+		return "variable"
+	case model.DefinitionArrayOrGrid:
+		return "array or grid"
 	default:
 		return "symbol"
 	}
@@ -455,6 +536,162 @@ func (i *Index) references(ctx context.Context, uri string, offset uint, include
 		return locations[left].Range.End < locations[right].Range.End
 	})
 	return locations, true, nil
+}
+
+func definitionAt(definitions []model.Definition, offset uint) (model.Definition, bool) {
+	var best model.Definition
+	found := false
+	for _, definition := range definitions {
+		if !rangeContains(definition.SelectionRange, offset) {
+			continue
+		}
+		if !found || definition.SelectionRange.End-definition.SelectionRange.Start < best.SelectionRange.End-best.SelectionRange.Start {
+			best = definition
+			found = true
+		}
+	}
+	return best, found
+}
+
+func referenceAt(references []model.Reference, offset uint) (model.Reference, bool) {
+	var best model.Reference
+	found := false
+	for _, reference := range references {
+		if !rangeContains(reference.Range, offset) {
+			continue
+		}
+		if !found || reference.Range.End-reference.Range.Start < best.Range.End-best.Range.Start {
+			best = reference
+			found = true
+		}
+	}
+	return best, found
+}
+
+func fileReferenceAt(references []model.Reference, offset uint) (model.Reference, bool) {
+	for _, reference := range references {
+		if reference.TargetFile != "" && rangeContains(reference.FileRange, offset) {
+			return reference, true
+		}
+	}
+	return model.Reference{}, false
+}
+
+func builtinAt(builtins []model.BuiltinUse, offset uint) (model.BuiltinUse, bool) {
+	for _, builtin := range builtins {
+		if rangeContains(builtin.Range, offset) {
+			return builtin, true
+		}
+	}
+	return model.BuiltinUse{}, false
+}
+
+func builtinHover(builtin model.BuiltinUse) string {
+	summaries := map[string]string{
+		"DEF":    "Declares a dialog variable or control.",
+		"IF":     "Begins a conditional block terminated by `ENDIF`.",
+		"SUB":    "Defines a named subprogram terminated by `END_SUB`.",
+		"OUTPUT": "Defines a named output block terminated by `END_OUTPUT`.",
+		"RETURN": "Returns from the current subprogram.",
+		"CALL":   "Calls a statically or dynamically named subprogram.",
+		"GC":     "Generates output from a named `OUTPUT` block.",
+		"LM":     "Loads or activates a named dialog, optionally from an explicit `.com` file.",
+		"LS":     "Loads a named softkey menu, optionally from an explicit `.com` file.",
+		"LB":     "Loads a named reusable block from an explicit `.com` file.",
+		"LA":     "Loads a named array, optionally from an explicit `.com` file.",
+		"LG":     "Uses a named grid defined in the current file.",
+		"TRUE":   "Boolean true constant.",
+		"FALSE":  "Boolean false constant.",
+	}
+	summary := summaries[builtin.Name]
+	if summary == "" {
+		return ""
+	}
+	kind := "keyword"
+	if builtin.Kind == model.BuiltinFunction {
+		kind = "built-in function"
+	} else if builtin.Kind == model.BuiltinConstant {
+		kind = "built-in constant"
+	}
+	return fmt.Sprintf("**%s** `%s`\n\n%s", kind, builtin.Name, summary)
+}
+
+func definitionHover(source Document, definition model.Definition) string {
+	lines := []string{fmt.Sprintf("**%s** `%s`", definitionKindDetail(definition.Kind), definition.Name)}
+	if definition.Type != "" {
+		lines = append(lines, fmt.Sprintf("Type: `%s`", definition.Type))
+	}
+	if definition.Version != "" {
+		lines = append(lines, fmt.Sprintf("Version: `%s`", definition.Version))
+	}
+	if owner := ownerDefinition(source, definition.Scope); owner.Name != "" {
+		lines = append(lines, fmt.Sprintf("Scope: %s `%s`", definitionKindDetail(owner.Kind), owner.Name))
+	}
+	return strings.Join(lines, "\n\n")
+}
+
+func (i *Index) referenceHover(source Document, reference model.Reference) string {
+	lines := []string{fmt.Sprintf("**%s reference** `%s`", definitionKindDetail(reference.Kind), reference.Name)}
+	if reference.TargetFile != "" {
+		lines = append(lines, fmt.Sprintf("Requested file: `%s`", reference.TargetFile))
+	}
+	if location, ok := i.resolveLocked(source.URI, reference); ok {
+		target, _ := i.documentLocked(location.URI)
+		if definition, found := definitionAtRange(target.Analysis.Definitions, location.Range); found {
+			lines = append(lines, fmt.Sprintf("Resolves to: %s `%s`", definitionKindDetail(definition.Kind), definition.Name))
+			if definition.Type != "" {
+				lines = append(lines, fmt.Sprintf("Type: `%s`", definition.Type))
+			}
+			if definition.Version != "" {
+				lines = append(lines, fmt.Sprintf("Version: `%s`", definition.Version))
+			}
+			if owner := ownerDefinition(target, definition.Scope); owner.Name != "" {
+				lines = append(lines, fmt.Sprintf("Scope: %s `%s`", definitionKindDetail(owner.Kind), owner.Name))
+			}
+		}
+		if target.Path != "" && target.URI != source.URI {
+			lines = append(lines, fmt.Sprintf("File: `%s`", filepath.Base(target.Path)))
+		}
+	} else {
+		lines = append(lines, "Target could not be resolved unambiguously.")
+	}
+	return strings.Join(lines, "\n\n")
+}
+
+func (i *Index) fileHover(source Document, reference model.Reference) string {
+	lines := []string{fmt.Sprintf("**Run MyScreens file** `%s`", reference.TargetFile)}
+	matches := i.targetFileURIsLocked(source, reference.TargetFile)
+	if len(matches) == 1 {
+		if target, ok := i.documentLocked(matches[0]); ok {
+			lines = append(lines, fmt.Sprintf("Resolved file: `%s`", filepath.Base(target.Path)))
+		}
+	} else if len(matches) == 0 {
+		lines = append(lines, "File was not found in the workspace.")
+	} else {
+		lines = append(lines, "File name is ambiguous in the workspace.")
+	}
+	return strings.Join(lines, "\n\n")
+}
+
+func ownerDefinition(document Document, scope []model.ByteRange) model.Definition {
+	if len(scope) == 0 {
+		return model.Definition{}
+	}
+	for _, definition := range document.Analysis.Definitions {
+		if definition.Range == scope[0] {
+			return definition
+		}
+	}
+	return model.Definition{}
+}
+
+func definitionAtRange(definitions []model.Definition, selection model.ByteRange) (model.Definition, bool) {
+	for _, definition := range definitions {
+		if definition.SelectionRange == selection {
+			return definition, true
+		}
+	}
+	return model.Definition{}, false
 }
 
 func (i *Index) targetAtLocked(source Document, offset uint) (Location, bool) {
@@ -683,6 +920,100 @@ func definitionMatches(reference model.Reference, definition model.Definition) b
 		return definition.Kind == model.DefinitionArray || definition.Kind == model.DefinitionGrid
 	}
 	return reference.Kind == definition.Kind
+}
+
+func (i *Index) semanticDiagnostics(ctx context.Context, source Document) ([]model.Diagnostic, error) {
+	var diagnostics []model.Diagnostic
+	seenDefinitions := make(map[string]bool)
+	for _, definition := range source.Analysis.Definitions {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if definition.Kind != model.DefinitionVariable || len(definition.Scope) == 0 {
+			continue
+		}
+		key := definition.Name + "\x00" + definition.Version + "\x00" + scopeKey(definition.Scope)
+		if seenDefinitions[key] {
+			diagnostics = append(diagnostics, model.Diagnostic{
+				Range: definition.SelectionRange, Code: "duplicate-def",
+				Message: fmt.Sprintf("Duplicate DEF %q in the same scope", definition.Name),
+			})
+		}
+		seenDefinitions[key] = true
+	}
+
+	for _, reference := range source.Analysis.References {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if reference.Kind == model.DefinitionVariable {
+			if _, result := resolveScoped(source, reference); result == resolutionAbsent && hasInvisibleLocal(source, reference) {
+				diagnostics = append(diagnostics, model.Diagnostic{
+					Range: reference.Range, Code: "undefined-local-variable",
+					Message: fmt.Sprintf("Local variable %q is not visible in this scope", reference.Name),
+				})
+			}
+			continue
+		}
+		if reference.TargetFile == "" || reference.FileRange == (model.ByteRange{}) || !strings.EqualFold(filepath.Ext(reference.TargetFile), ".com") {
+			continue
+		}
+		matches := i.targetFileURIsLocked(source, reference.TargetFile)
+		switch len(matches) {
+		case 0:
+			diagnostics = append(diagnostics, model.Diagnostic{
+				Range: reference.FileRange, Code: "missing-target-file",
+				Message: fmt.Sprintf("Run MyScreens file %q was not found", reference.TargetFile),
+			})
+		case 1:
+			target, ok := i.documentLocked(matches[0])
+			if !ok || !target.Analysis.SemanticComplete {
+				continue
+			}
+			count := 0
+			for _, definition := range target.Analysis.Definitions {
+				if definitionMatches(reference, definition) {
+					count++
+				}
+			}
+			if count == 0 {
+				diagnostics = append(diagnostics, model.Diagnostic{
+					Range: reference.Range, Code: "missing-target-entity",
+					Message: fmt.Sprintf("File %q contains no %s named %q", reference.TargetFile, definitionKindDetail(reference.Kind), reference.Name),
+				})
+			}
+		}
+	}
+	sort.Slice(diagnostics, func(left, right int) bool {
+		if diagnostics[left].Range.Start != diagnostics[right].Range.Start {
+			return diagnostics[left].Range.Start < diagnostics[right].Range.Start
+		}
+		return diagnostics[left].Code < diagnostics[right].Code
+	})
+	return diagnostics, nil
+}
+
+func hasInvisibleLocal(source Document, reference model.Reference) bool {
+	if len(reference.Scope) == 0 {
+		return false
+	}
+	for _, definition := range source.Analysis.Definitions {
+		if definition.Kind != model.DefinitionVariable || definition.Name != reference.Name || len(definition.Scope) == 0 {
+			continue
+		}
+		if definition.Scope[0] == reference.Scope[0] && !visibleFrom(reference, definition) {
+			return true
+		}
+	}
+	return false
+}
+
+func scopeKey(scope []model.ByteRange) string {
+	var builder strings.Builder
+	for _, item := range scope {
+		fmt.Fprintf(&builder, "%d:%d;", item.Start, item.End)
+	}
+	return builder.String()
 }
 
 func (i *Index) targetFileURIsLocked(source Document, targetFile string) []string {

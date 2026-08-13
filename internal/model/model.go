@@ -68,6 +68,8 @@ type Definition struct {
 	Range          ByteRange
 	SelectionRange ByteRange
 	Scope          []ByteRange
+	Version        string
+	Type           string
 }
 
 type Reference struct {
@@ -120,10 +122,32 @@ type CompletionItem struct {
 	Kind       CompletionItemKind
 }
 
+type BuiltinKind uint8
+
+const (
+	BuiltinUnknown BuiltinKind = iota
+	BuiltinKeyword
+	BuiltinFunction
+	BuiltinConstant
+)
+
+type BuiltinUse struct {
+	Name  string
+	Kind  BuiltinKind
+	Range ByteRange
+}
+
+type Hover struct {
+	Range    ByteRange
+	Contents string
+}
+
 type Analysis struct {
-	Diagnostics []Diagnostic
-	Symbols     []Symbol
-	Folds       []Fold
-	Definitions []Definition
-	References  []Reference
+	Diagnostics      []Diagnostic
+	Symbols          []Symbol
+	Folds            []Fold
+	Definitions      []Definition
+	References       []Reference
+	Builtins         []BuiltinUse
+	SemanticComplete bool
 }

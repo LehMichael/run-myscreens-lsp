@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/LehMichael/run-myscreens-lsp/internal/document"
@@ -259,6 +260,97 @@ func TestCompletionProvidesKeywordsLocalsTargetsAndFiles(t *testing.T) {
 	}
 }
 
+func TestHoverAndSemanticDiagnosticsUseUTF16AndCrossFileResolution(t *testing.T) {
+	root := t.TempDir()
+	sharedPath := filepath.Join(root, "Shared.com")
+	if err := os.WriteFile(sharedPath, []byte("//M(Target)\n//END\n"), 0o600); err != nil {
+		t.Fatalf("write shared: %v", err)
+	}
+	uri := workspace.FileURI(filepath.Join(root, "Main.com"))
+	source := "//M(Main)\nDEF value(1)=(R1//1)\nDEF value(1)=(R1//2)\nLOAD\n  value=\"😀\" << LM(\"TARGET\", \"shared.COM\")\n  LS(\"Menu\", \"missing.com\")\nEND_LOAD\n//END\n"
+	input := bytes.NewBufferString(
+		frameJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"rootUri": workspace.FileURI(root), "capabilities": map[string]any{}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": "run-myscreens", "version": 1, "text": source}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "textDocument/hover", "params": map[string]any{"textDocument": map[string]any{"uri": uri}, "position": map[string]any{"line": 4, "character": 21}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "textDocument/hover", "params": map[string]any{"textDocument": map[string]any{"uri": uri}, "position": map[string]any{"line": 4, "character": 17}}}),
+	)
+	var output bytes.Buffer
+	languageServer := New(protocol.NewConnection(input, &output), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
+	if err := languageServer.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	messages := readMessages(t, &output)
+	var initialize protocol.InitializeResult
+	if err := json.Unmarshal(messageByID(t, messages, "1").Result, &initialize); err != nil {
+		t.Fatalf("decode initialize: %v", err)
+	}
+	if !initialize.Capabilities.HoverProvider {
+		t.Fatal("hover provider was not advertised")
+	}
+	diagnostics := diagnosticsForURI(t, messages, uri)
+	if len(diagnostics.Diagnostics) != 2 {
+		t.Fatalf("diagnostics = %#v", diagnostics.Diagnostics)
+	}
+	if diagnostics.Diagnostics[0].Code != "duplicate-def" || diagnostics.Diagnostics[0].Range.Start != (protocol.Position{Line: 2, Character: 4}) {
+		t.Fatalf("duplicate diagnostic = %#v", diagnostics.Diagnostics[0])
+	}
+	if diagnostics.Diagnostics[1].Code != "missing-target-file" || diagnostics.Diagnostics[1].Range.Start.Line != 5 {
+		t.Fatalf("missing-file diagnostic = %#v", diagnostics.Diagnostics[1])
+	}
+	var entityHover protocol.Hover
+	if err := json.Unmarshal(messageByID(t, messages, "2").Result, &entityHover); err != nil {
+		t.Fatalf("decode entity hover: %v", err)
+	}
+	if !strings.Contains(entityHover.Contents.Value, "Resolves to: dialog `Target`") || entityHover.Range == nil || entityHover.Range.Start != (protocol.Position{Line: 4, Character: 19}) {
+		t.Fatalf("entity hover = %#v", entityHover)
+	}
+	var builtinHover protocol.Hover
+	if err := json.Unmarshal(messageByID(t, messages, "3").Result, &builtinHover); err != nil {
+		t.Fatalf("decode builtin hover: %v", err)
+	}
+	if !strings.Contains(builtinHover.Contents.Value, "built-in function") || builtinHover.Range == nil || builtinHover.Range.Start != (protocol.Position{Line: 4, Character: 16}) {
+		t.Fatalf("builtin hover = %#v", builtinHover)
+	}
+}
+
+func TestOpeningTargetOverlayClearsDependentSemanticDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	sharedPath := filepath.Join(root, "Shared.com")
+	if err := os.WriteFile(sharedPath, []byte("//M(Other)\n//END\n"), 0o600); err != nil {
+		t.Fatalf("write shared: %v", err)
+	}
+	mainURI := workspace.FileURI(filepath.Join(root, "Main.com"))
+	sharedURI := workspace.FileURI(sharedPath)
+	mainSource := "//M(Main)\nLOAD\n  LM(\"Target\", \"Shared.com\")\nEND_LOAD\n//END\n"
+	sharedOverlay := "//M(Target)\n//END\n"
+	input := bytes.NewBufferString(
+		frameJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"rootUri": workspace.FileURI(root), "capabilities": map[string]any{}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": map[string]any{"textDocument": map[string]any{"uri": mainURI, "languageId": "run-myscreens", "version": 1, "text": mainSource}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": map[string]any{"textDocument": map[string]any{"uri": sharedURI, "languageId": "run-myscreens", "version": 1, "text": sharedOverlay}}}) +
+			frame(`{"jsonrpc":"2.0","id":2,"method":"shutdown"}`) +
+			frame(`{"jsonrpc":"2.0","method":"exit"}`),
+	)
+	var output bytes.Buffer
+	languageServer := New(protocol.NewConnection(input, &output), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
+	if err := languageServer.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	messages := readMessages(t, &output)
+	var mainPublications []protocol.PublishDiagnosticsParams
+	for _, message := range messages {
+		if message.Method != "textDocument/publishDiagnostics" {
+			continue
+		}
+		publication := decodeDiagnostics(t, message)
+		if publication.URI == mainURI {
+			mainPublications = append(mainPublications, publication)
+		}
+	}
+	if len(mainPublications) != 2 || len(mainPublications[0].Diagnostics) != 1 || mainPublications[0].Diagnostics[0].Code != "missing-target-entity" || len(mainPublications[1].Diagnostics) != 0 {
+		t.Fatalf("main diagnostic publications = %#v", mainPublications)
+	}
+}
+
 func TestReferencesConcurrencyRequiresInitializedActiveServer(t *testing.T) {
 	languageServer := New(protocol.NewConnection(bytes.NewReader(nil), io.Discard), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
 	message := protocol.Message{ID: json.RawMessage(`1`), Method: "textDocument/references"}
@@ -273,8 +365,12 @@ func TestReferencesConcurrencyRequiresInitializedActiveServer(t *testing.T) {
 	if !languageServer.isConcurrentRequest(completion) {
 		t.Fatal("completion was not concurrent after initialization")
 	}
+	hover := protocol.Message{ID: json.RawMessage(`3`), Method: "textDocument/hover"}
+	if !languageServer.isConcurrentRequest(hover) {
+		t.Fatal("hover was not concurrent after initialization")
+	}
 	languageServer.shutdown = true
-	if languageServer.isConcurrentRequest(message) || languageServer.isConcurrentRequest(completion) {
+	if languageServer.isConcurrentRequest(message) || languageServer.isConcurrentRequest(completion) || languageServer.isConcurrentRequest(hover) {
 		t.Fatal("semantic request dispatched concurrently after shutdown")
 	}
 }
@@ -320,6 +416,21 @@ func TestCanceledConcurrentRequestReturnsRequestCanceled(t *testing.T) {
 	responses := readMessages(t, &output)
 	if len(responses) != 1 || responses[0].Error == nil || responses[0].Error.Code != protocol.ErrorCodeRequestCanceled {
 		t.Fatalf("canceled response = %#v", responses)
+	}
+}
+
+func TestCanceledHoverReturnsRequestCanceled(t *testing.T) {
+	var output bytes.Buffer
+	languageServer := New(protocol.NewConnection(bytes.NewReader(nil), &output), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
+	languageServer.initialized = true
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	message := protocol.Message{JSONRPC: "2.0", ID: json.RawMessage(`8`), Method: "textDocument/hover", Params: json.RawMessage(`{"textDocument":{"uri":"file:///missing.com"},"position":{"line":0,"character":0}}`)}
+	languageServer.startRequest(ctx, message)
+	languageServer.requestsWG.Wait()
+	responses := readMessages(t, &output)
+	if len(responses) != 1 || responses[0].Error == nil || responses[0].Error.Code != protocol.ErrorCodeRequestCanceled {
+		t.Fatalf("canceled hover response = %#v", responses)
 	}
 }
 
@@ -436,6 +547,21 @@ func messageByID(t *testing.T, messages []protocol.Message, id string) protocol.
 	}
 	t.Fatalf("response id %s not found in %#v", id, messages)
 	return protocol.Message{}
+}
+
+func diagnosticsForURI(t *testing.T, messages []protocol.Message, uri string) protocol.PublishDiagnosticsParams {
+	t.Helper()
+	for _, message := range messages {
+		if message.Method != "textDocument/publishDiagnostics" {
+			continue
+		}
+		publication := decodeDiagnostics(t, message)
+		if publication.URI == uri {
+			return publication
+		}
+	}
+	t.Fatalf("diagnostics for %q not found", uri)
+	return protocol.PublishDiagnosticsParams{}
 }
 
 func decodeDiagnostics(t *testing.T, message protocol.Message) protocol.PublishDiagnosticsParams {

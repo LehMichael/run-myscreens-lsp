@@ -111,6 +111,37 @@ func TestAnalyzeLowersDefinitionsAndStaticReferences(t *testing.T) {
 	}
 }
 
+func TestAnalyzeExtractsDeclarationMetadataAndBuiltins(t *testing.T) {
+	source := []byte("//M(Main)\nDEF legacy(1)=(R1//1)\nDEF modern(2)={TYP=\"I\", VAL=2}\nLOAD\n  IF TRUE\n    CALL(\"Work\")\n  ENDIF\nEND_LOAD\nSUB(Work)\n  RETURN\nEND_SUB\n//END\n")
+	analysis, err := NewTreeSitterAnalyzer().Analyze(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if !analysis.SemanticComplete {
+		t.Fatalf("analysis was unexpectedly incomplete: %#v", analysis.Diagnostics)
+	}
+	if len(analysis.Definitions) < 3 || analysis.Definitions[1].Version != "1" || analysis.Definitions[1].Type != "R1" || analysis.Definitions[2].Version != "2" || analysis.Definitions[2].Type != "I" {
+		t.Fatalf("declaration metadata = %#v", analysis.Definitions)
+	}
+	want := map[string]bool{"DEF": true, "IF": true, "TRUE": true, "CALL": true, "SUB": true, "RETURN": true}
+	for _, builtin := range analysis.Builtins {
+		delete(want, builtin.Name)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing builtins %v from %#v", want, analysis.Builtins)
+	}
+}
+
+func TestAnalyzeMarksMalformedSourceSemanticallyIncomplete(t *testing.T) {
+	analysis, err := NewTreeSitterAnalyzer().Analyze(context.Background(), []byte("//M(Main)\nLOAD\n  IF value\n"))
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if analysis.SemanticComplete {
+		t.Fatal("malformed analysis was marked semantically complete")
+	}
+}
+
 func TestAnalyzeScopesReferencesToTheirEvent(t *testing.T) {
 	source := []byte("//M(Main)\n" +
 		"LOAD\n" +

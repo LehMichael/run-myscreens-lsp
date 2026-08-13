@@ -42,11 +42,11 @@ func (a *TreeSitterAnalyzer) Analyze(ctx context.Context, source []byte) (model.
 	defer tree.Close()
 
 	root := tree.RootNode()
-	analysis := model.Analysis{}
+	analysis := model.Analysis{SemanticComplete: !root.HasError()}
 	collectDiagnostics(root, false, &analysis.Diagnostics)
 	analysis.Symbols = collectSymbols(root, source)
 	collectFolds(root, &analysis.Folds)
-	collectSemantics(root, source, nil, false, &analysis.Definitions, &analysis.References)
+	collectSemantics(root, source, nil, false, &analysis.Definitions, &analysis.References, &analysis.Builtins)
 	return analysis, nil
 }
 
@@ -755,12 +755,15 @@ func isFoldable(kind string) bool {
 	}
 }
 
-func collectSemantics(node *tree_sitter.Node, source []byte, scope []model.ByteRange, allowVariables bool, definitions *[]model.Definition, references *[]model.Reference) {
+func collectSemantics(node *tree_sitter.Node, source []byte, scope []model.ByteRange, allowVariables bool, definitions *[]model.Definition, references *[]model.Reference, builtins *[]model.BuiltinUse) {
 	if definition, ok := lowerDefinition(node, source, scope); ok {
 		*definitions = append(*definitions, definition)
 	}
 	if reference, ok := lowerReference(node, source, scope, allowVariables); ok {
 		*references = append(*references, reference)
+	}
+	if builtin, ok := lowerBuiltin(node, source); ok {
+		*builtins = append(*builtins, builtin)
 	}
 
 	childScope := scope
@@ -774,7 +777,7 @@ func collectSemantics(node *tree_sitter.Node, source []byte, scope []model.ByteR
 			continue
 		}
 		childAllowsVariables := childrenAllowVariables && !suppressesVariableReferences(node, child)
-		collectSemantics(child, source, childScope, childAllowsVariables, definitions, references)
+		collectSemantics(child, source, childScope, childAllowsVariables, definitions, references, builtins)
 	}
 }
 
@@ -791,13 +794,66 @@ func lowerDefinition(node *tree_sitter.Node, source []byte, scope []model.ByteRa
 	if name == "" {
 		return model.Definition{}, false
 	}
-	return model.Definition{
+	definition := model.Definition{
 		Name:           name,
 		Kind:           kind,
 		Range:          byteRange(node),
 		SelectionRange: byteRange(selection),
 		Scope:          appendRanges(nil, scope),
-	}, true
+	}
+	if kind == model.DefinitionVariable {
+		definition.Version = declarationVersion(node, source)
+		definition.Type = declarationType(node, source)
+	}
+	return definition, true
+}
+
+func declarationVersion(node *tree_sitter.Node, source []byte) string {
+	version := node.ChildByFieldName("version")
+	if version == nil {
+		return ""
+	}
+	text := strings.TrimSpace(nodeText(version, source))
+	return strings.TrimSuffix(strings.TrimPrefix(text, "("), ")")
+}
+
+func declarationType(node *tree_sitter.Node, source []byte) string {
+	value := node.ChildByFieldName("value")
+	if value == nil {
+		return ""
+	}
+	switch value.Kind() {
+	case "legacy_field_record":
+		for index := uint(0); index < value.NamedChildCount(); index++ {
+			field := value.NamedChild(index)
+			if field == nil || field.Kind() == "comment" {
+				continue
+			}
+			text := strings.TrimSpace(nodeText(field, source))
+			if field.Kind() == "legacy_field" {
+				return text
+			}
+			return ""
+		}
+	case "property_record":
+		for index := uint(0); index < value.NamedChildCount(); index++ {
+			assignment := value.NamedChild(index)
+			if assignment == nil || assignment.Kind() != "property_assignment" {
+				continue
+			}
+			name := assignment.ChildByFieldName("name")
+			propertyValue := assignment.ChildByFieldName("value")
+			if name == nil || propertyValue == nil || !strings.EqualFold(nodeText(name, source), "TYP") {
+				continue
+			}
+			if propertyValue.Kind() == "string" {
+				if decoded, ok := decodeString(propertyValue, source); ok {
+					return decoded
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func definitionKind(nodeKind string) (model.DefinitionKind, bool) {
@@ -887,6 +943,56 @@ func lowerReference(node *tree_sitter.Node, source []byte, scope []model.ByteRan
 		}, true
 	}
 	return model.Reference{}, false
+}
+
+func lowerBuiltin(node *tree_sitter.Node, source []byte) (model.BuiltinUse, bool) {
+	if node.Kind() == "call_expression" {
+		function := node.ChildByFieldName("function")
+		if function == nil || function.Kind() != "identifier" {
+			return model.BuiltinUse{}, false
+		}
+		name := strings.ToUpper(nodeText(function, source))
+		switch name {
+		case "CALL", "GC", "LM", "LS", "LB", "LA", "LG":
+			return model.BuiltinUse{Name: name, Kind: model.BuiltinFunction, Range: byteRange(function)}, true
+		}
+	}
+	if node.Kind() == "boolean" {
+		name := strings.ToUpper(nodeText(node, source))
+		if name == "TRUE" || name == "FALSE" {
+			return model.BuiltinUse{Name: name, Kind: model.BuiltinConstant, Range: byteRange(node)}, true
+		}
+	}
+	name, ok := builtinKeyword(node.Kind())
+	if !ok {
+		return model.BuiltinUse{}, false
+	}
+	start := node.StartByte()
+	for start < node.EndByte() && start < uint(len(source)) && (source[start] == ' ' || source[start] == '\t' || source[start] == '\f') {
+		start++
+	}
+	end := start + uint(len(name))
+	if end <= node.EndByte() && end <= uint(len(source)) && strings.EqualFold(string(source[start:end]), name) {
+		return model.BuiltinUse{Name: name, Kind: model.BuiltinKeyword, Range: model.ByteRange{Start: start, End: end}}, true
+	}
+	return model.BuiltinUse{}, false
+}
+
+func builtinKeyword(nodeKind string) (string, bool) {
+	switch nodeKind {
+	case "declaration_statement":
+		return "DEF", true
+	case "if_statement":
+		return "IF", true
+	case "subprogram":
+		return "SUB", true
+	case "output_block":
+		return "OUTPUT", true
+	case "return_statement":
+		return "RETURN", true
+	default:
+		return "", false
+	}
 }
 
 func containsExecutableExpressions(nodeKind string) bool {

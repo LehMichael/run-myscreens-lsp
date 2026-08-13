@@ -575,6 +575,132 @@ func TestCompletionsHonorCancellation(t *testing.T) {
 	}
 }
 
+func TestSemanticDiagnosticsAreConservativeAndCaseSensitiveForDuplicates(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	dialog := model.ByteRange{Start: 0, End: 200}
+	firstEvent := model.ByteRange{Start: 10, End: 80}
+	secondEvent := model.ByteRange{Start: 80, End: 160}
+	index := New()
+	index.Overlay(uri, "source", model.Analysis{SemanticComplete: true, Definitions: []model.Definition{
+		{Name: "value", Kind: model.DefinitionVariable, SelectionRange: model.ByteRange{Start: 1, End: 6}, Scope: []model.ByteRange{dialog}, Version: "1"},
+		{Name: "value", Kind: model.DefinitionVariable, SelectionRange: model.ByteRange{Start: 10, End: 15}, Scope: []model.ByteRange{dialog}, Version: "1"},
+		{Name: "Value", Kind: model.DefinitionVariable, SelectionRange: model.ByteRange{Start: 20, End: 25}, Scope: []model.ByteRange{dialog}, Version: "1"},
+		{Name: "temp", Kind: model.DefinitionVariable, SelectionRange: model.ByteRange{Start: 30, End: 34}, Scope: []model.ByteRange{dialog, firstEvent}},
+	}, References: []model.Reference{
+		{Name: "temp", Kind: model.DefinitionVariable, Range: model.ByteRange{Start: 90, End: 94}, Scope: []model.ByteRange{dialog, secondEvent}},
+		{Name: "runtimeName", Kind: model.DefinitionVariable, Range: model.ByteRange{Start: 100, End: 111}, Scope: []model.ByteRange{dialog, secondEvent}},
+	}})
+	_, revision, _ := index.DocumentSnapshot(uri)
+	diagnostics, stale, err := index.SemanticDiagnosticsAtRevision(context.Background(), uri, revision)
+	if err != nil || stale || len(diagnostics) != 2 {
+		t.Fatalf("diagnostics = %#v, stale=%v, err=%v", diagnostics, stale, err)
+	}
+	if diagnostics[0].Code != "duplicate-def" || diagnostics[0].Range.Start != 10 || diagnostics[1].Code != "undefined-local-variable" || diagnostics[1].Range.Start != 90 {
+		t.Fatalf("diagnostics = %#v", diagnostics)
+	}
+}
+
+func TestSemanticDiagnosticsDistinguishMissingAmbiguousAndMalformedTargets(t *testing.T) {
+	root := t.TempDir()
+	mainPath := filepath.Join(root, "Main.com")
+	sharedPath := filepath.Join(root, "Shared.com")
+	writeTestFile(t, mainPath, "//M(Main)\nLOAD\n  LM(\"MissingEntity\", \"Shared.com\")\n  LS(\"Menu\", \"Absent.com\")\nEND_LOAD\n//END\n")
+	writeTestFile(t, sharedPath, "//M(Other)\n//END\n")
+	firstAmbiguousDir := filepath.Join(root, "first")
+	secondAmbiguousDir := filepath.Join(root, "second")
+	if err := os.MkdirAll(firstAmbiguousDir, 0o700); err != nil {
+		t.Fatalf("mkdir first: %v", err)
+	}
+	if err := os.MkdirAll(secondAmbiguousDir, 0o700); err != nil {
+		t.Fatalf("mkdir second: %v", err)
+	}
+	writeTestFile(t, filepath.Join(firstAmbiguousDir, "Duplicate.com"), "//M(One)\n//END\n")
+	writeTestFile(t, filepath.Join(secondAmbiguousDir, "duplicate.COM"), "//M(Two)\n//END\n")
+	index := New()
+	analyzer := syntax.NewTreeSitterAnalyzer()
+	if err := index.Load(context.Background(), []string{FileURI(root)}, analyzer); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	uri := FileURI(mainPath)
+	_, revision, _ := index.DocumentSnapshot(uri)
+	diagnostics, stale, err := index.SemanticDiagnosticsAtRevision(context.Background(), uri, revision)
+	if err != nil || stale || len(diagnostics) != 2 {
+		t.Fatalf("diagnostics = %#v, stale=%v, err=%v", diagnostics, stale, err)
+	}
+	codes := map[string]bool{}
+	for _, diagnostic := range diagnostics {
+		codes[diagnostic.Code] = true
+	}
+	if !codes["missing-target-file"] || !codes["missing-target-entity"] {
+		t.Fatalf("diagnostic codes = %v", codes)
+	}
+
+	ambiguousText := "//M(Main)\nLOAD\n  LM(\"Missing\", \"duplicate.com\")\nEND_LOAD\n//END\n"
+	ambiguousAnalysis, err := analyzer.Analyze(context.Background(), []byte(ambiguousText))
+	if err != nil {
+		t.Fatalf("Analyze ambiguous: %v", err)
+	}
+	index.Overlay(uri, ambiguousText, ambiguousAnalysis)
+	_, revision, _ = index.DocumentSnapshot(uri)
+	diagnostics, stale, err = index.SemanticDiagnosticsAtRevision(context.Background(), uri, revision)
+	if err != nil || stale || len(diagnostics) != 0 {
+		t.Fatalf("ambiguous diagnostics = %#v, stale=%v, err=%v", diagnostics, stale, err)
+	}
+
+	malformedText := "//M(Main)\nLOAD\n  LM(\"Missing\", \"Absent.com\")\n"
+	malformedAnalysis, err := analyzer.Analyze(context.Background(), []byte(malformedText))
+	if err != nil {
+		t.Fatalf("Analyze malformed: %v", err)
+	}
+	if malformedAnalysis.SemanticComplete {
+		t.Fatal("malformed analysis marked complete")
+	}
+	index.Overlay(uri, malformedText, malformedAnalysis)
+	_, revision, _ = index.DocumentSnapshot(uri)
+	diagnostics, stale, err = index.SemanticDiagnosticsAtRevision(context.Background(), uri, revision)
+	if err != nil || stale || len(diagnostics) != 0 {
+		t.Fatalf("malformed diagnostics = %#v, stale=%v, err=%v", diagnostics, stale, err)
+	}
+}
+
+func TestHoverShowsDefinitionReferenceFileAndBuiltin(t *testing.T) {
+	root := t.TempDir()
+	mainPath := filepath.Join(root, "Main.com")
+	sharedPath := filepath.Join(root, "Shared.com")
+	mainText := "//M(Main)\nDEF value(2)=(R1//1)\nLOAD\n  IF TRUE\n    value=1\n    LM(\"TARGET\", \"shared.COM\")\n  ENDIF\nEND_LOAD\n//END\n"
+	writeTestFile(t, mainPath, mainText)
+	writeTestFile(t, sharedPath, "//M(Target)\n//END\n")
+	index := New()
+	if err := index.Load(context.Background(), []string{FileURI(root)}, syntax.NewTreeSitterAnalyzer()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	uri := FileURI(mainPath)
+	_, revision, _ := index.DocumentSnapshot(uri)
+	tests := []struct {
+		needle   string
+		advance  int
+		contains []string
+	}{
+		{"value(2)", 1, []string{"variable", "value", "Type: `R1`", "Version: `2`", "dialog `Main`"}},
+		{"value=1", 1, []string{"variable reference", "Resolves to: variable `value`", "Type: `R1`"}},
+		{"TARGET", 1, []string{"dialog reference", "Resolves to: dialog `Target`", "File: `Shared.com`"}},
+		{"shared.COM", 1, []string{"Run MyScreens file", "Resolved file: `Shared.com`"}},
+		{"IF TRUE", 1, []string{"keyword", "IF", "conditional block"}},
+	}
+	for _, test := range tests {
+		offset := uint(strings.Index(mainText, test.needle) + test.advance)
+		hover, found, stale, err := index.HoverAtRevision(context.Background(), uri, offset, revision)
+		if err != nil || stale || !found {
+			t.Fatalf("hover for %q = %#v, found=%v stale=%v err=%v", test.needle, hover, found, stale, err)
+		}
+		for _, expected := range test.contains {
+			if !strings.Contains(hover.Contents, expected) {
+				t.Errorf("hover for %q = %q, want %q", test.needle, hover.Contents, expected)
+			}
+		}
+	}
+}
+
 func TestPathFromFileURI(t *testing.T) {
 	path, err := PathFromFileURI("file:///tmp/Run%20MyScreens")
 	if err != nil {
