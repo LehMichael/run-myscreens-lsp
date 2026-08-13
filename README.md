@@ -13,6 +13,9 @@ Current foundation:
 - Full-text `didOpen`, `didChange`, and `didClose`
 - UTF-16-correct LSP positions
 - Tree-sitter syntax, missing-node, and mismatched-event diagnostics
+- Parser-independent semantic document model cached by document version
+- Hierarchical document symbols for definitions, declarations, events, subprograms, and outputs
+- Folding ranges for definitions, events, subprograms, conditionals, switches, loops, and outputs
 - Diagnostic clearing when a document closes
 
 The grammar dependency uses a local `replace` during development. Replace the temporary `example.com` module paths only after public repository ownership is decided.

@@ -1,6 +1,10 @@
 package document
 
-import "sync"
+import (
+	"sync"
+
+	"example.com/run-myscreens-lsp/internal/model"
+)
 
 type Store struct {
 	mu        sync.RWMutex
@@ -28,6 +32,27 @@ func (s *Store) Replace(uri string, version int32, text string) (*Document, bool
 	}
 	document.Replace(version, text)
 	return document, true
+}
+
+func (s *Store) SetAnalysis(uri string, version int32, analysis model.Analysis) (*Document, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	document, ok := s.documents[uri]
+	if !ok || document.Version != version {
+		return nil, false
+	}
+	document.Analysis = analysis
+	return document, true
+}
+
+func (s *Store) Get(uri string) (Document, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	document, ok := s.documents[uri]
+	if !ok {
+		return Document{}, false
+	}
+	return *document, true
 }
 
 func (s *Store) Close(uri string) bool {

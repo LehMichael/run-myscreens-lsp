@@ -84,6 +84,31 @@ type DidCloseTextDocumentParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
 }
 
+type DocumentSymbolParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+}
+
+type FoldingRangeParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+}
+
+type DocumentSymbol struct {
+	Name           string           `json:"name"`
+	Detail         string           `json:"detail,omitempty"`
+	Kind           int              `json:"kind"`
+	Range          Range            `json:"range"`
+	SelectionRange Range            `json:"selectionRange"`
+	Children       []DocumentSymbol `json:"children,omitempty"`
+}
+
+type FoldingRange struct {
+	StartLine      uint32 `json:"startLine"`
+	StartCharacter uint32 `json:"startCharacter,omitempty"`
+	EndLine        uint32 `json:"endLine"`
+	EndCharacter   uint32 `json:"endCharacter,omitempty"`
+	Kind           string `json:"kind,omitempty"`
+}
+
 type InitializeParams struct {
 	ProcessID    *int32 `json:"processId,omitempty"`
 	RootURI      string `json:"rootUri,omitempty"`
@@ -96,8 +121,10 @@ type InitializeResult struct {
 }
 
 type ServerCapabilities struct {
-	PositionEncoding string                  `json:"positionEncoding"`
-	TextDocumentSync TextDocumentSyncOptions `json:"textDocumentSync"`
+	PositionEncoding       string                  `json:"positionEncoding"`
+	TextDocumentSync       TextDocumentSyncOptions `json:"textDocumentSync"`
+	DocumentSymbolProvider bool                    `json:"documentSymbolProvider"`
+	FoldingRangeProvider   bool                    `json:"foldingRangeProvider"`
 }
 
 type TextDocumentSyncOptions struct {

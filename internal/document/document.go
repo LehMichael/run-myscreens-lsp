@@ -5,6 +5,7 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
+	"example.com/run-myscreens-lsp/internal/model"
 	"example.com/run-myscreens-lsp/internal/protocol"
 )
 
@@ -13,6 +14,7 @@ type Document struct {
 	LanguageID string
 	Version    int32
 	Text       string
+	Analysis   model.Analysis
 	lineStarts []int
 }
 
@@ -25,6 +27,7 @@ func New(uri, languageID string, version int32, text string) *Document {
 func (d *Document) Replace(version int32, text string) {
 	d.Version = version
 	d.Text = text
+	d.Analysis = model.Analysis{}
 	d.reindex()
 }
 
