@@ -104,9 +104,37 @@ func TestAnalyzeLowersDefinitionsAndStaticReferences(t *testing.T) {
 	}
 	for index, want := range wantReferences {
 		got := analysis.References[index]
-		if got.Name != want.name || got.Kind != want.kind || got.TargetFile != want.targetFile || len(got.Scope) != 1 {
-			t.Errorf("reference %d = %#v, want name=%q kind=%d target=%q scope=1", index, got, want.name, want.kind, want.targetFile)
+		if got.Name != want.name || got.Kind != want.kind || got.TargetFile != want.targetFile || len(got.Scope) != 2 {
+			t.Errorf("reference %d = %#v, want name=%q kind=%d target=%q scope=2", index, got, want.name, want.kind, want.targetFile)
 		}
+	}
+}
+
+func TestAnalyzeScopesReferencesToTheirEvent(t *testing.T) {
+	source := []byte("//M(Main)\n" +
+		"LOAD\n" +
+		"  LB(\"Helpers\", \"blocks.com\")\n" +
+		"  CALL(\"Work\")\n" +
+		"END_LOAD\n" +
+		"PRESS(VS1)\n" +
+		"  CALL(\"Work\")\n" +
+		"END_PRESS\n" +
+		"//END\n")
+	analysis, err := NewTreeSitterAnalyzer().Analyze(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if len(analysis.References) != 3 {
+		t.Fatalf("references = %#v", analysis.References)
+	}
+	load := analysis.References[0]
+	loadCall := analysis.References[1]
+	pressCall := analysis.References[2]
+	if len(load.Scope) != 2 || len(loadCall.Scope) != 2 || load.Scope[1] != loadCall.Scope[1] {
+		t.Fatalf("load scopes = %#v and %#v", load.Scope, loadCall.Scope)
+	}
+	if len(pressCall.Scope) != 2 || pressCall.Scope[1] == load.Scope[1] {
+		t.Fatalf("press scope = %#v, load scope = %#v", pressCall.Scope, load.Scope)
 	}
 }
 

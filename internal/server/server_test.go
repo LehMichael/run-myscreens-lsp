@@ -151,6 +151,126 @@ func TestDefinitionResolvesSameAndCrossFileWithUTF16Ranges(t *testing.T) {
 	}
 }
 
+func TestReferencesResolveCrossFileWithUTF16Ranges(t *testing.T) {
+	root := t.TempDir()
+	targetPath := filepath.Join(root, "Shared.com")
+	if err := os.WriteFile(targetPath, []byte("; 😀\n//M(Target)\n//END\n"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	otherPath := filepath.Join(root, "Other.com")
+	if err := os.WriteFile(otherPath, []byte("//M(Other)\nLOAD\n  LM(\"target\", \"SHARED.com\")\nEND_LOAD\n//END\n"), 0o600); err != nil {
+		t.Fatalf("write other: %v", err)
+	}
+	uri := workspace.FileURI(filepath.Join(root, "Main.com"))
+	source := "//M(Main)\nLOAD\n  value=\"😀\" << LM(\"TARGET\", \"shared.COM\")\nEND_LOAD\n//END\n"
+	input := bytes.NewBufferString(
+		frameJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"rootUri": workspace.FileURI(root), "capabilities": map[string]any{}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": "run-myscreens", "version": 1, "text": source}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "textDocument/references", "params": map[string]any{"textDocument": map[string]any{"uri": uri}, "position": map[string]any{"line": 2, "character": 20}, "context": map[string]any{"includeDeclaration": true}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "textDocument/references", "params": map[string]any{"textDocument": map[string]any{"uri": uri}, "position": map[string]any{"line": 0, "character": 0}, "context": map[string]any{"includeDeclaration": false}}}),
+	)
+	var output bytes.Buffer
+	languageServer := New(protocol.NewConnection(input, &output), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
+	if err := languageServer.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	messages := readMessages(t, &output)
+	if len(messages) != 4 {
+		t.Fatalf("message count = %d, want 4: %#v", len(messages), messages)
+	}
+	initializeMessage := messageByID(t, messages, "1")
+	var initialize protocol.InitializeResult
+	if err := json.Unmarshal(initializeMessage.Result, &initialize); err != nil {
+		t.Fatalf("decode initialize: %v", err)
+	}
+	if !initialize.Capabilities.ReferencesProvider {
+		t.Fatal("references provider was not advertised")
+	}
+	var locations []protocol.Location
+	if err := json.Unmarshal(messageByID(t, messages, "2").Result, &locations); err != nil {
+		t.Fatalf("decode references: %v", err)
+	}
+	if len(locations) != 3 {
+		t.Fatalf("references = %#v", locations)
+	}
+	if locations[0].URI != uri || locations[0].Range.Start != (protocol.Position{Line: 2, Character: 19}) || locations[0].Range.End != (protocol.Position{Line: 2, Character: 27}) {
+		t.Fatalf("open-buffer UTF-16 reference = %#v", locations[0])
+	}
+	if locations[1].URI != workspace.FileURI(otherPath) || locations[1].Range.Start != (protocol.Position{Line: 2, Character: 5}) {
+		t.Fatalf("other-file reference = %#v", locations[1])
+	}
+	if locations[2].URI != workspace.FileURI(targetPath) || locations[2].Range.Start != (protocol.Position{Line: 1, Character: 4}) {
+		t.Fatalf("declaration = %#v", locations[2])
+	}
+	var empty []protocol.Location
+	if err := json.Unmarshal(messageByID(t, messages, "3").Result, &empty); err != nil {
+		t.Fatalf("decode empty references: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty references = %#v", empty)
+	}
+}
+
+func TestReferencesConcurrencyRequiresInitializedActiveServer(t *testing.T) {
+	languageServer := New(protocol.NewConnection(bytes.NewReader(nil), io.Discard), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
+	message := protocol.Message{ID: json.RawMessage(`1`), Method: "textDocument/references"}
+	if languageServer.isConcurrentRequest(message) {
+		t.Fatal("references dispatched concurrently before initialization")
+	}
+	languageServer.initialized = true
+	if !languageServer.isConcurrentRequest(message) {
+		t.Fatal("references was not concurrent after initialization")
+	}
+	languageServer.shutdown = true
+	if languageServer.isConcurrentRequest(message) {
+		t.Fatal("references dispatched concurrently after shutdown")
+	}
+}
+
+func TestRequestAfterShutdownReturnsInvalidRequest(t *testing.T) {
+	var output bytes.Buffer
+	languageServer := New(protocol.NewConnection(bytes.NewReader(nil), &output), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
+	languageServer.initialized = true
+	languageServer.shutdown = true
+	message := protocol.Message{JSONRPC: "2.0", ID: json.RawMessage(`9`), Method: "textDocument/references", Params: json.RawMessage(`{}`)}
+	if err := languageServer.handle(context.Background(), message); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	responses := readMessages(t, &output)
+	if len(responses) != 1 || responses[0].Error == nil || responses[0].Error.Code != protocol.ErrorCodeInvalidRequest {
+		t.Fatalf("post-shutdown response = %#v", responses)
+	}
+}
+
+func TestCancelRequestCancelsRegisteredRequest(t *testing.T) {
+	languageServer := New(protocol.NewConnection(bytes.NewReader(nil), io.Discard), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	languageServer.requests["42"] = cancel
+	if err := languageServer.cancelRequest(json.RawMessage(`{"id":42}`)); err != nil {
+		t.Fatalf("cancelRequest: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("registered request was not canceled")
+	}
+}
+
+func TestCanceledConcurrentRequestReturnsRequestCanceled(t *testing.T) {
+	var output bytes.Buffer
+	languageServer := New(protocol.NewConnection(bytes.NewReader(nil), &output), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
+	languageServer.initialized = true
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	message := protocol.Message{JSONRPC: "2.0", ID: json.RawMessage(`7`), Method: "textDocument/references", Params: json.RawMessage(`{"textDocument":{"uri":"file:///missing.com"},"position":{"line":0,"character":0},"context":{"includeDeclaration":false}}`)}
+	languageServer.startRequest(ctx, message)
+	languageServer.requestsWG.Wait()
+	responses := readMessages(t, &output)
+	if len(responses) != 1 || responses[0].Error == nil || responses[0].Error.Code != protocol.ErrorCodeRequestCanceled {
+		t.Fatalf("canceled response = %#v", responses)
+	}
+}
+
 func TestPublishedDiagnosticRangeUsesUTF16(t *testing.T) {
 	uri := "file:///workspace/unicode.com"
 	source := "//M(Test)\nDEF value={ST=\"😀\", BC=}\n//END\n"
@@ -192,6 +312,17 @@ func readMessages(t *testing.T, output io.Reader) []protocol.Message {
 		}
 		messages = append(messages, message)
 	}
+}
+
+func messageByID(t *testing.T, messages []protocol.Message, id string) protocol.Message {
+	t.Helper()
+	for _, message := range messages {
+		if string(message.ID) == id {
+			return message
+		}
+	}
+	t.Fatalf("response id %s not found in %#v", id, messages)
+	return protocol.Message{}
 }
 
 func decodeDiagnostics(t *testing.T, message protocol.Message) protocol.PublishDiagnosticsParams {

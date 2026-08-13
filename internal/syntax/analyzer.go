@@ -459,7 +459,9 @@ func decodeString(node *tree_sitter.Node, source []byte) (string, bool) {
 
 func isSemanticScope(nodeKind string) bool {
 	switch nodeKind {
-	case "dialog_definition", "softkey_menu_definition", "array_definition", "block_definition", "grid_definition", "subprogram", "output_block":
+	case "dialog_definition", "softkey_menu_definition", "array_definition", "block_definition", "grid_definition", "subprogram", "output_block",
+		"load_event", "unload_event", "change_event", "press_event", "focus_event", "accesslevel_event", "channel_event",
+		"control_event", "language_event", "resolution_event", "suspend_event", "resume_event", "start_softkey_press_event":
 		return true
 	default:
 		return false

@@ -20,6 +20,7 @@ Current foundation:
 - Open-document overlays with close-time disk refresh
 - Case-insensitive, spelling-preserving definition lookup
 - `textDocument/definition` for local variables, same-file `CALL`/`GC`, explicitly named `LM`/`LS`/`LB`/`LA` targets, and calls into explicitly loaded block files
+- `textDocument/references` from declarations or references, with `includeDeclaration`, cross-file overlays, deterministic ordering, and the same conservative ambiguity rules
 - Diagnostic clearing when a document closes
 
 Definition resolution is intentionally conservative: dynamic expressions and ambiguous targets return no result rather than guessing. The grammar dependency is versioned from [`github.com/LehMichael/tree-sitter-run-myscreens`](https://github.com/LehMichael/tree-sitter-run-myscreens).

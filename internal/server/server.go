@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
 
 	"github.com/LehMichael/run-myscreens-lsp/internal/document"
 	"github.com/LehMichael/run-myscreens-lsp/internal/model"
@@ -28,6 +29,9 @@ type Server struct {
 	logger      *log.Logger
 	initialized bool
 	shutdown    bool
+	requestsMu  sync.Mutex
+	requests    map[string]context.CancelFunc
+	requestsWG  sync.WaitGroup
 }
 
 func New(connection *protocol.Connection, analyzer syntax.Analyzer, logger *log.Logger) *Server {
@@ -37,6 +41,7 @@ func New(connection *protocol.Connection, analyzer syntax.Analyzer, logger *log.
 		analyzer:   analyzer,
 		workspace:  workspace.New(),
 		logger:     logger,
+		requests:   make(map[string]context.CancelFunc),
 	}
 }
 
@@ -45,6 +50,7 @@ func (s *Server) Run(ctx context.Context) error {
 		message, err := s.connection.Read()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				s.requestsWG.Wait()
 				return nil
 			}
 			return err
@@ -53,7 +59,18 @@ func (s *Server) Run(ctx context.Context) error {
 			if !s.shutdown {
 				return errors.New("received exit before shutdown")
 			}
+			s.requestsWG.Wait()
 			return nil
+		}
+		if message.Method == "$/cancelRequest" {
+			if err := s.cancelRequest(message.Params); err != nil && s.logger != nil {
+				s.logger.Printf("%s: %v", message.Method, err)
+			}
+			continue
+		}
+		if s.isConcurrentRequest(message) {
+			s.startRequest(ctx, message)
+			continue
 		}
 		if err := s.handle(ctx, message); err != nil {
 			if len(message.ID) > 0 {
@@ -67,7 +84,66 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
+func (s *Server) isConcurrentRequest(message protocol.Message) bool {
+	return s.initialized && !s.shutdown && len(message.ID) > 0 && message.Method == "textDocument/references"
+}
+
+func (s *Server) startRequest(parent context.Context, message protocol.Message) {
+	ctx, cancel := context.WithCancel(parent)
+	key := string(message.ID)
+	s.requestsMu.Lock()
+	s.requests[key] = cancel
+	s.requestsMu.Unlock()
+	s.requestsWG.Add(1)
+	go func() {
+		defer s.requestsWG.Done()
+		defer cancel()
+		defer func() {
+			s.requestsMu.Lock()
+			delete(s.requests, key)
+			s.requestsMu.Unlock()
+		}()
+		if err := s.handle(ctx, message); err != nil {
+			responseError := protocol.ResponseError{Code: protocol.ErrorCodeInternalError, Message: err.Error()}
+			if errors.Is(err, context.Canceled) {
+				responseError = protocol.ResponseError{Code: protocol.ErrorCodeRequestCanceled, Message: "request canceled"}
+			}
+			if replyErr := s.connection.ReplyError(message.ID, responseError); replyErr != nil && s.logger != nil {
+				s.logger.Printf("%s: %v", message.Method, replyErr)
+			}
+		}
+	}()
+}
+
+func (s *Server) cancelRequest(paramsJSON json.RawMessage) error {
+	var params protocol.CancelParams
+	if err := json.Unmarshal(paramsJSON, &params); err != nil {
+		return fmt.Errorf("decode cancel params: %w", err)
+	}
+	s.requestsMu.Lock()
+	cancel := s.requests[string(params.ID)]
+	s.requestsMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return nil
+}
+
+func (s *Server) cancelAllRequests() {
+	s.requestsMu.Lock()
+	defer s.requestsMu.Unlock()
+	for _, cancel := range s.requests {
+		cancel()
+	}
+}
+
 func (s *Server) handle(ctx context.Context, message protocol.Message) error {
+	if s.shutdown {
+		if len(message.ID) > 0 {
+			return s.connection.ReplyError(message.ID, protocol.ResponseError{Code: protocol.ErrorCodeInvalidRequest, Message: "server has shut down"})
+		}
+		return nil
+	}
 	if message.Method != "initialize" && !s.initialized {
 		if len(message.ID) > 0 {
 			return s.connection.ReplyError(message.ID, protocol.ResponseError{Code: protocol.ErrorCodeServerNotInit, Message: "server not initialized"})
@@ -104,12 +180,15 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 				DocumentSymbolProvider: true,
 				FoldingRangeProvider:   true,
 				DefinitionProvider:     true,
+				ReferencesProvider:     true,
 			},
 			ServerInfo: protocol.ServerInfo{Name: serverName, Version: serverVersion},
 		})
 	case "initialized":
 		return nil
 	case "shutdown":
+		s.cancelAllRequests()
+		s.requestsWG.Wait()
 		s.shutdown = true
 		return s.connection.Reply(message.ID, nil)
 	case "textDocument/didOpen":
@@ -168,6 +247,16 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 			return s.connection.Reply(message.ID, nil)
 		}
 		return s.connection.Reply(message.ID, location)
+	case "textDocument/references":
+		var params protocol.ReferenceParams
+		if err := json.Unmarshal(message.Params, &params); err != nil {
+			return fmt.Errorf("decode references params: %w", err)
+		}
+		locations, err := s.references(ctx, params)
+		if err != nil {
+			return err
+		}
+		return s.connection.Reply(message.ID, locations)
 	case "textDocument/foldingRange":
 		var params protocol.FoldingRangeParams
 		if err := json.Unmarshal(message.Params, &params); err != nil {
@@ -236,6 +325,40 @@ func (s *Server) definition(params protocol.TextDocumentPositionParams) (*protoc
 	}
 	target := document.New(resolved.URI, "run-myscreens", 0, resolved.Text)
 	return &protocol.Location{URI: resolved.URI, Range: target.Range(resolved.Range.Start, resolved.Range.End)}, true
+}
+
+func (s *Server) references(ctx context.Context, params protocol.ReferenceParams) ([]protocol.Location, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		indexed, revision, ok := s.workspace.DocumentSnapshot(params.TextDocument.URI)
+		if !ok {
+			return []protocol.Location{}, nil
+		}
+		doc := document.New(indexed.URI, "run-myscreens", 0, indexed.Text)
+		offset, ok := doc.ByteOffsetAt(params.Position)
+		if !ok {
+			return []protocol.Location{}, nil
+		}
+		locations, found, stale, err := s.workspace.ReferencesAtRevision(ctx, indexed.URI, offset, params.Context.IncludeDeclaration, revision)
+		if err != nil {
+			return nil, err
+		}
+		if stale {
+			continue
+		}
+		if !found {
+			return []protocol.Location{}, nil
+		}
+		result := make([]protocol.Location, 0, len(locations))
+		for _, location := range locations {
+			target := document.New(location.URI, "run-myscreens", 0, location.Text)
+			result = append(result, protocol.Location{URI: location.URI, Range: target.Range(location.Range.Start, location.Range.End)})
+		}
+		return result, nil
+	}
+	return []protocol.Location{}, nil
 }
 
 func referenceAt(references []model.Reference, offset uint) (model.Reference, bool) {

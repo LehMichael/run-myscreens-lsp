@@ -3,13 +3,18 @@ package protocol
 import "encoding/json"
 
 const (
-	ErrorCodeParseError     = -32700
-	ErrorCodeInvalidRequest = -32600
-	ErrorCodeMethodNotFound = -32601
-	ErrorCodeInvalidParams  = -32602
-	ErrorCodeInternalError  = -32603
-	ErrorCodeServerNotInit  = -32002
+	ErrorCodeParseError      = -32700
+	ErrorCodeInvalidRequest  = -32600
+	ErrorCodeMethodNotFound  = -32601
+	ErrorCodeInvalidParams   = -32602
+	ErrorCodeInternalError   = -32603
+	ErrorCodeServerNotInit   = -32002
+	ErrorCodeRequestCanceled = -32800
 )
+
+type CancelParams struct {
+	ID json.RawMessage `json:"id"`
+}
 
 type Message struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -97,6 +102,16 @@ type TextDocumentPositionParams struct {
 	Position     Position               `json:"position"`
 }
 
+type ReferenceContext struct {
+	IncludeDeclaration bool `json:"includeDeclaration"`
+}
+
+type ReferenceParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+	Context      ReferenceContext       `json:"context"`
+}
+
 type Location struct {
 	URI   string `json:"uri"`
 	Range Range  `json:"range"`
@@ -142,6 +157,7 @@ type ServerCapabilities struct {
 	DocumentSymbolProvider bool                    `json:"documentSymbolProvider"`
 	FoldingRangeProvider   bool                    `json:"foldingRangeProvider"`
 	DefinitionProvider     bool                    `json:"definitionProvider"`
+	ReferencesProvider     bool                    `json:"referencesProvider"`
 }
 
 type TextDocumentSyncOptions struct {

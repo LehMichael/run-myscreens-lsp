@@ -152,6 +152,53 @@ func TestResolveCallInExplicitlyLoadedBlockFile(t *testing.T) {
 	}
 }
 
+func TestResolveLoadedCallUsesExactBlockAndOwningEntity(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	blocksURI := "file:///workspace/blocks.com"
+	dialogA := model.ByteRange{Start: 0, End: 100}
+	dialogB := model.ByteRange{Start: 100, End: 200}
+	loadEvent := model.ByteRange{Start: 10, End: 20}
+	subprogram := model.ByteRange{Start: 20, End: 30}
+	otherEvent := model.ByteRange{Start: 110, End: 120}
+	loadedBlock := model.ByteRange{Start: 0, End: 50}
+	unloadedBlock := model.ByteRange{Start: 50, End: 100}
+	index := New()
+	index.Overlay(uri, "source", model.Analysis{References: []model.Reference{
+		{Name: "Loaded", Kind: model.DefinitionBlock, TargetFile: "blocks.com", Scope: []model.ByteRange{dialogA, loadEvent}},
+	}})
+	index.Overlay(blocksURI, "blocks", model.Analysis{Definitions: []model.Definition{
+		{Name: "Loaded", Kind: model.DefinitionBlock, Range: loadedBlock, SelectionRange: model.ByteRange{Start: 1, End: 7}},
+		{Name: "Work", Kind: model.DefinitionSubprogram, SelectionRange: model.ByteRange{Start: 10, End: 14}, Scope: []model.ByteRange{loadedBlock}},
+		{Name: "Other", Kind: model.DefinitionBlock, Range: unloadedBlock, SelectionRange: model.ByteRange{Start: 51, End: 56}},
+		{Name: "Work", Kind: model.DefinitionSubprogram, SelectionRange: model.ByteRange{Start: 60, End: 64}, Scope: []model.ByteRange{unloadedBlock}},
+	}})
+	location, ok := index.Resolve(uri, model.Reference{Name: "work", Kind: model.DefinitionSubprogram, Scope: []model.ByteRange{dialogA, subprogram}})
+	if !ok || location.Range != (model.ByteRange{Start: 10, End: 14}) {
+		t.Fatalf("loaded block call = %#v, %v", location, ok)
+	}
+	if _, ok := index.Resolve(uri, model.Reference{Name: "work", Kind: model.DefinitionSubprogram, Scope: []model.ByteRange{dialogB, otherEvent}}); ok {
+		t.Fatal("call resolved through an LB from another scope")
+	}
+}
+
+func TestResolveDeduplicatesRepeatedLoadsOfSameBlock(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	blocksURI := "file:///workspace/blocks.com"
+	dialog := model.ByteRange{Start: 0, End: 100}
+	block := model.ByteRange{Start: 0, End: 50}
+	load := model.Reference{Name: "Loaded", Kind: model.DefinitionBlock, TargetFile: "blocks.com", Scope: []model.ByteRange{dialog}}
+	index := New()
+	index.Overlay(uri, "source", model.Analysis{References: []model.Reference{load, load}})
+	index.Overlay(blocksURI, "blocks", model.Analysis{Definitions: []model.Definition{
+		{Name: "Loaded", Kind: model.DefinitionBlock, Range: block, SelectionRange: model.ByteRange{Start: 1, End: 7}},
+		{Name: "Work", Kind: model.DefinitionSubprogram, SelectionRange: model.ByteRange{Start: 10, End: 14}, Scope: []model.ByteRange{block}},
+	}})
+	location, ok := index.Resolve(uri, model.Reference{Name: "work", Kind: model.DefinitionSubprogram, Scope: []model.ByteRange{dialog}})
+	if !ok || location.Range != (model.ByteRange{Start: 10, End: 14}) {
+		t.Fatalf("repeated load call = %#v, %v", location, ok)
+	}
+}
+
 func TestResolveDoesNotFallThroughAmbiguousLocalToLoadedDefinition(t *testing.T) {
 	uri := "file:///workspace/main.com"
 	loadedURI := "file:///workspace/blocks.com"
@@ -194,6 +241,143 @@ func TestResolveReturnsNoResultForAmbiguousEntity(t *testing.T) {
 	})
 	if _, ok := index.Resolve(uri, model.Reference{Name: "DUPLICATE", Kind: model.DefinitionSubprogram}); ok {
 		t.Fatal("Resolve returned an ambiguous definition")
+	}
+}
+
+func TestReferencesFromDefinitionAndReferencePositions(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	text := "Value value VALUE"
+	scope := model.ByteRange{Start: 0, End: 100}
+	index := New()
+	index.Overlay(uri, text, model.Analysis{
+		Definitions: []model.Definition{{Name: "Value", Kind: model.DefinitionVariable, SelectionRange: model.ByteRange{Start: 0, End: 5}, Scope: []model.ByteRange{scope}}},
+		References: []model.Reference{
+			{Name: "value", Kind: model.DefinitionVariable, Range: model.ByteRange{Start: 6, End: 11}, Scope: []model.ByteRange{scope}},
+			{Name: "VALUE", Kind: model.DefinitionVariable, Range: model.ByteRange{Start: 12, End: 17}, Scope: []model.ByteRange{scope}},
+		},
+	})
+
+	locations, found, err := index.References(context.Background(), uri, 2, false)
+	if err != nil || !found {
+		t.Fatalf("References from definition = %#v, %v, %v", locations, found, err)
+	}
+	if len(locations) != 2 || locations[0].Range.Start != 6 || locations[1].Range.Start != 12 {
+		t.Fatalf("references without declaration = %#v", locations)
+	}
+	locations, found, err = index.References(context.Background(), uri, 8, true)
+	if err != nil || !found {
+		t.Fatalf("References from reference = %#v, %v, %v", locations, found, err)
+	}
+	if len(locations) != 3 || locations[0].Range.Start != 0 || locations[1].Range.Start != 6 || locations[2].Range.Start != 12 {
+		t.Fatalf("references with declaration = %#v", locations)
+	}
+}
+
+func TestReferencesAcrossExplicitFileAndLoadedBlock(t *testing.T) {
+	root := t.TempDir()
+	mainPath := filepath.Join(root, "main.com")
+	writeTestFile(t, mainPath, "//M(Main)\nLOAD\n  LM(\"target\", \"shared.COM\")\n  LB(\"helpers\", \"BLOCKS.com\")\n  CALL(\"work\")\nEND_LOAD\n//END\n")
+	otherPath := filepath.Join(root, "other.com")
+	writeTestFile(t, otherPath, "//M(Other)\nLOAD\n  LM(\"TARGET\", \"Shared.com\")\n  LB(\"Helpers\", \"blocks.COM\")\n  CALL(\"WORK\")\nEND_LOAD\n//END\n")
+	sharedPath := filepath.Join(root, "Shared.com")
+	writeTestFile(t, sharedPath, "//M(Target)\n//END\n")
+	blocksPath := filepath.Join(root, "Blocks.com")
+	writeTestFile(t, blocksPath, "//B(Helpers)\nSUB(Work)\nEND_SUB\n//END\n")
+
+	index := New()
+	if err := index.Load(context.Background(), []string{FileURI(root)}, syntax.NewTreeSitterAnalyzer()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	locations, found, err := index.References(context.Background(), FileURI(sharedPath), uint(len("//M(Ta")), true)
+	if err != nil || !found || len(locations) != 3 {
+		t.Fatalf("entity references = %#v, %v, %v", locations, found, err)
+	}
+	if locations[0].URI != FileURI(sharedPath) || locations[1].URI != FileURI(mainPath) || locations[2].URI != FileURI(otherPath) {
+		t.Fatalf("entity reference order = %#v", locations)
+	}
+	locations, found, err = index.References(context.Background(), FileURI(blocksPath), uint(len("//B(Helpers)\nSUB(Wo")), false)
+	if err != nil || !found || len(locations) != 2 {
+		t.Fatalf("loaded CALL references = %#v, %v, %v", locations, found, err)
+	}
+	if locations[0].URI != FileURI(mainPath) || locations[1].URI != FileURI(otherPath) {
+		t.Fatalf("CALL reference order = %#v", locations)
+	}
+}
+
+func TestOverlayCollapsesCaseEquivalentDiskURI(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "Shared.com")
+	writeTestFile(t, path, "//M(Disk)\n//END\n")
+	index := New()
+	analyzer := syntax.NewTreeSitterAnalyzer()
+	if err := index.Load(context.Background(), []string{FileURI(root)}, analyzer); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	text := "//M(Buffer)\n//END\n"
+	analysis, err := analyzer.Analyze(context.Background(), []byte(text))
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	aliasURI := FileURI(filepath.Join(root, "shared.com"))
+	index.Overlay(aliasURI, text, analysis)
+	document, ok := index.Document(FileURI(path))
+	if !ok || document.URI != FileURI(path) || document.Analysis.Definitions[0].Name != "Buffer" {
+		t.Fatalf("case-equivalent overlay = %#v, %v", document, ok)
+	}
+	locations, found, err := index.References(context.Background(), aliasURI, uint(len("//M(Bu")), true)
+	if err != nil || !found || len(locations) != 1 || locations[0].URI != FileURI(path) {
+		t.Fatalf("case-equivalent references = %#v, %v, %v", locations, found, err)
+	}
+}
+
+func TestReferencesUseOverlaysAndRejectAmbiguousTargets(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	index := New()
+	index.Overlay(uri, "Old old", model.Analysis{
+		Definitions: []model.Definition{{Name: "Old", Kind: model.DefinitionSubprogram, SelectionRange: model.ByteRange{Start: 0, End: 3}}},
+		References:  []model.Reference{{Name: "old", Kind: model.DefinitionSubprogram, Range: model.ByteRange{Start: 4, End: 7}}},
+	})
+	locations, found, err := index.References(context.Background(), uri, 1, false)
+	if err != nil || !found || len(locations) != 1 || locations[0].Range.Start != 4 {
+		t.Fatalf("overlay references = %#v, %v, %v", locations, found, err)
+	}
+	index.Overlay(uri, "Dup dup", model.Analysis{
+		Definitions: []model.Definition{
+			{Name: "Dup", Kind: model.DefinitionSubprogram, SelectionRange: model.ByteRange{Start: 0, End: 3}},
+			{Name: "dup", Kind: model.DefinitionSubprogram, SelectionRange: model.ByteRange{Start: 0, End: 3}},
+		},
+		References: []model.Reference{{Name: "dup", Kind: model.DefinitionSubprogram, Range: model.ByteRange{Start: 4, End: 7}}},
+	})
+	locations, found, err = index.References(context.Background(), uri, 5, false)
+	if err != nil || found || len(locations) != 0 {
+		t.Fatalf("ambiguous references = %#v, %v, %v", locations, found, err)
+	}
+}
+
+func TestReferencesRejectStaleRevision(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	index := New()
+	index.Overlay(uri, "Old", model.Analysis{Definitions: []model.Definition{{Name: "Old", Kind: model.DefinitionDialog, SelectionRange: model.ByteRange{Start: 0, End: 3}}}})
+	_, revision, ok := index.DocumentSnapshot(uri)
+	if !ok {
+		t.Fatal("DocumentSnapshot did not find overlay")
+	}
+	index.Overlay(uri, "New", model.Analysis{Definitions: []model.Definition{{Name: "New", Kind: model.DefinitionDialog, SelectionRange: model.ByteRange{Start: 0, End: 3}}}})
+	locations, found, stale, err := index.ReferencesAtRevision(context.Background(), uri, 1, true, revision)
+	if err != nil || !stale || found || locations != nil {
+		t.Fatalf("stale references = %#v, %v, %v, %v", locations, found, stale, err)
+	}
+}
+
+func TestReferencesHonorCancellation(t *testing.T) {
+	uri := "file:///workspace/main.com"
+	index := New()
+	index.Overlay(uri, "Target", model.Analysis{Definitions: []model.Definition{{Name: "Target", Kind: model.DefinitionDialog, SelectionRange: model.ByteRange{Start: 0, End: 6}}}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	locations, found, err := index.References(ctx, uri, 1, false)
+	if err != context.Canceled || found || locations != nil {
+		t.Fatalf("canceled references = %#v, %v, %v", locations, found, err)
 	}
 }
 

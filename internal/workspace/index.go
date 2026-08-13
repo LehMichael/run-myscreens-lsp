@@ -25,9 +25,10 @@ type Document struct {
 }
 
 type Location struct {
-	URI   string
-	Text  string
-	Range model.ByteRange
+	URI             string
+	Text            string
+	Range           model.ByteRange
+	DefinitionRange model.ByteRange
 }
 
 type Index struct {
@@ -36,6 +37,7 @@ type Index struct {
 	overlays  map[string]Document
 	paths     map[string][]string
 	filenames map[string][]string
+	revision  uint64
 }
 
 func New() *Index {
@@ -72,6 +74,7 @@ func (i *Index) Load(ctx context.Context, rootURIs []string, analyzer syntax.Ana
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.disk = disk
+	i.revision++
 	i.rebuildPathsLocked()
 	return nil
 }
@@ -117,12 +120,23 @@ func (i *Index) Overlay(uri, text string, analysis model.Analysis) {
 	canonicalURI, path := canonicalDocumentIdentity(uri)
 	i.mu.Lock()
 	defer i.mu.Unlock()
+	canonicalURI = i.uriForPathLocked(canonicalURI, path)
+	if existing, ok := i.documentLocked(canonicalURI); ok && existing.Path != "" {
+		path = existing.Path
+	}
 	i.overlays[canonicalURI] = Document{URI: canonicalURI, Path: path, Text: text, Analysis: analysis}
+	i.revision++
 	i.rebuildPathsLocked()
 }
 
 func (i *Index) RemoveOverlay(ctx context.Context, uri string, analyzer syntax.Analyzer) error {
 	canonicalURI, path := canonicalDocumentIdentity(uri)
+	i.mu.RLock()
+	canonicalURI = i.uriForPathLocked(canonicalURI, path)
+	if existing, ok := i.documentLocked(canonicalURI); ok && existing.Path != "" {
+		path = existing.Path
+	}
+	i.mu.RUnlock()
 	var diskDocument Document
 	var diskExists bool
 	if path != "" && strings.EqualFold(filepath.Ext(path), ".com") {
@@ -140,28 +154,159 @@ func (i *Index) RemoveOverlay(ctx context.Context, uri string, analyzer syntax.A
 
 	i.mu.Lock()
 	defer i.mu.Unlock()
+	canonicalURI = i.uriForPathLocked(canonicalURI, path)
 	delete(i.overlays, canonicalURI)
 	if diskExists {
 		i.disk[diskDocument.URI] = diskDocument
 	} else {
 		delete(i.disk, canonicalURI)
 	}
+	i.revision++
 	i.rebuildPathsLocked()
 	return nil
 }
 
 func (i *Index) Document(uri string) (Document, bool) {
-	canonicalURI, _ := canonicalDocumentIdentity(uri)
+	document, _, ok := i.DocumentSnapshot(uri)
+	return document, ok
+}
+
+func (i *Index) DocumentSnapshot(uri string) (Document, uint64, bool) {
+	canonicalURI, path := canonicalDocumentIdentity(uri)
 	i.mu.RLock()
 	defer i.mu.RUnlock()
-	return i.documentLocked(canonicalURI)
+	document, ok := i.documentLocked(i.uriForPathLocked(canonicalURI, path))
+	return document, i.revision, ok
 }
 
 func (i *Index) Resolve(uri string, reference model.Reference) (Location, bool) {
-	canonicalURI, _ := canonicalDocumentIdentity(uri)
+	canonicalURI, path := canonicalDocumentIdentity(uri)
 	i.mu.RLock()
 	defer i.mu.RUnlock()
+	return i.resolveLocked(i.uriForPathLocked(canonicalURI, path), reference)
+}
 
+func (i *Index) References(ctx context.Context, uri string, offset uint, includeDeclaration bool) ([]Location, bool, error) {
+	return i.references(ctx, uri, offset, includeDeclaration, 0, false)
+}
+
+func (i *Index) ReferencesAtRevision(ctx context.Context, uri string, offset uint, includeDeclaration bool, revision uint64) ([]Location, bool, bool, error) {
+	locations, found, err := i.references(ctx, uri, offset, includeDeclaration, revision, true)
+	if errors.Is(err, errStaleRevision) {
+		return nil, false, true, nil
+	}
+	return locations, found, false, err
+}
+
+var errStaleRevision = errors.New("workspace revision changed")
+
+func (i *Index) references(ctx context.Context, uri string, offset uint, includeDeclaration bool, revision uint64, requireRevision bool) ([]Location, bool, error) {
+	canonicalURI, path := canonicalDocumentIdentity(uri)
+	i.mu.RLock()
+	if requireRevision && revision != i.revision {
+		i.mu.RUnlock()
+		return nil, false, errStaleRevision
+	}
+	canonicalURI = i.uriForPathLocked(canonicalURI, path)
+	snapshot := i.snapshotLocked()
+	i.mu.RUnlock()
+
+	source, ok := snapshot.documentLocked(canonicalURI)
+	if !ok {
+		return nil, false, nil
+	}
+	target, ok := snapshot.targetAtLocked(source, offset)
+	if !ok {
+		return nil, false, nil
+	}
+
+	var locations []Location
+	if includeDeclaration {
+		locations = append(locations, target)
+	}
+	for _, candidate := range snapshot.documentsLocked() {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		for _, reference := range candidate.Analysis.References {
+			if err := ctx.Err(); err != nil {
+				return nil, false, err
+			}
+			resolved, ok := snapshot.resolveLocked(candidate.URI, reference)
+			if ok && sameLocation(resolved, target) {
+				locations = append(locations, Location{URI: candidate.URI, Text: candidate.Text, Range: reference.Range})
+			}
+		}
+	}
+	sort.Slice(locations, func(left, right int) bool {
+		if locations[left].URI != locations[right].URI {
+			return locations[left].URI < locations[right].URI
+		}
+		if locations[left].Range.Start != locations[right].Range.Start {
+			return locations[left].Range.Start < locations[right].Range.Start
+		}
+		return locations[left].Range.End < locations[right].Range.End
+	})
+	return locations, true, nil
+}
+
+func (i *Index) targetAtLocked(source Document, offset uint) (Location, bool) {
+	var target Location
+	found := false
+	bestLength := ^uint(0)
+	for _, definition := range source.Analysis.Definitions {
+		if !rangeContains(definition.SelectionRange, offset) {
+			continue
+		}
+		length := definition.SelectionRange.End - definition.SelectionRange.Start
+		if length < bestLength {
+			target = Location{URI: source.URI, Text: source.Text, Range: definition.SelectionRange, DefinitionRange: definition.Range}
+			bestLength = length
+			found = true
+		}
+	}
+	for _, reference := range source.Analysis.References {
+		if !rangeContains(reference.Range, offset) {
+			continue
+		}
+		length := reference.Range.End - reference.Range.Start
+		if length >= bestLength {
+			continue
+		}
+		resolved, ok := i.resolveLocked(source.URI, reference)
+		if !ok {
+			continue
+		}
+		target = resolved
+		bestLength = length
+		found = true
+	}
+	return target, found
+}
+
+func (i *Index) documentsLocked() []Document {
+	documents := make([]Document, 0, len(i.disk)+len(i.overlays))
+	for uri, document := range i.disk {
+		if _, overlaid := i.overlays[uri]; !overlaid {
+			documents = append(documents, document)
+		}
+	}
+	for _, document := range i.overlays {
+		documents = append(documents, document)
+	}
+	sort.Slice(documents, func(left, right int) bool { return documents[left].URI < documents[right].URI })
+	return documents
+}
+
+func sameLocation(left, right Location) bool {
+	return left.URI == right.URI && left.Range == right.Range
+}
+
+func rangeContains(byteRange model.ByteRange, offset uint) bool {
+	return byteRange.Start <= offset && offset < byteRange.End
+}
+
+func (i *Index) resolveLocked(canonicalURI string, reference model.Reference) (Location, bool) {
 	source, ok := i.documentLocked(canonicalURI)
 	if !ok {
 		return Location{}, false
@@ -184,7 +329,7 @@ func (i *Index) Resolve(uri string, reference model.Reference) (Location, bool) 
 		return Location{}, false
 	}
 	if reference.Kind == model.DefinitionSubprogram || reference.Kind == model.DefinitionOutput {
-		return i.resolveInDocumentsLocked(i.loadedDocumentURIsLocked(source), reference)
+		return i.resolveInLoadedBlocksLocked(source, reference)
 	}
 	return Location{}, false
 }
@@ -203,7 +348,7 @@ func (i *Index) resolveInDocumentsLocked(candidateURIs []string, reference model
 		}
 		for _, definition := range document.Analysis.Definitions {
 			if definitionMatches(reference, definition) {
-				matches = append(matches, Location{URI: document.URI, Text: document.Text, Range: definition.SelectionRange})
+				matches = append(matches, Location{URI: document.URI, Text: document.Text, Range: definition.SelectionRange, DefinitionRange: definition.Range})
 			}
 		}
 	}
@@ -213,18 +358,50 @@ func (i *Index) resolveInDocumentsLocked(candidateURIs []string, reference model
 	return Location{}, false
 }
 
-func (i *Index) loadedDocumentURIsLocked(source Document) []string {
-	var uris []string
-	for _, reference := range source.Analysis.References {
-		if reference.Kind != model.DefinitionBlock || reference.TargetFile == "" {
+func (i *Index) resolveInLoadedBlocksLocked(source Document, call model.Reference) (Location, bool) {
+	unique := make(map[string]Location)
+	for _, load := range source.Analysis.References {
+		if load.Kind != model.DefinitionBlock || load.TargetFile == "" || !sameOwningEntity(load.Scope, call.Scope) {
 			continue
 		}
-		matches := i.targetFileURIsLocked(source, reference.TargetFile)
-		if len(matches) == 1 {
-			uris = append(uris, matches[0])
+		block, ok := i.resolveLocked(source.URI, load)
+		if !ok {
+			continue
+		}
+		document, ok := i.documentLocked(block.URI)
+		if !ok {
+			continue
+		}
+		for _, definition := range document.Analysis.Definitions {
+			if definitionMatches(call, definition) && scopeContains(definition.Scope, block.DefinitionRange) {
+				location := Location{URI: document.URI, Text: document.Text, Range: definition.SelectionRange, DefinitionRange: definition.Range}
+				unique[locationKey(location)] = location
+			}
 		}
 	}
-	return uris
+	if len(unique) == 1 {
+		for _, location := range unique {
+			return location, true
+		}
+	}
+	return Location{}, false
+}
+
+func sameOwningEntity(left, right []model.ByteRange) bool {
+	return len(left) > 0 && len(right) > 0 && left[0] == right[0]
+}
+
+func locationKey(location Location) string {
+	return fmt.Sprintf("%s:%d:%d", location.URI, location.Range.Start, location.Range.End)
+}
+
+func scopeContains(scope []model.ByteRange, owner model.ByteRange) bool {
+	for _, candidate := range scope {
+		if candidate == owner {
+			return true
+		}
+	}
+	return false
 }
 
 type resolutionResult uint8
@@ -263,7 +440,7 @@ func resolveScoped(document Document, reference model.Reference) (Location, reso
 	case 0:
 		return Location{}, resolutionAbsent
 	case 1:
-		return Location{URI: document.URI, Text: document.Text, Range: matches[0].SelectionRange}, resolutionFound
+		return Location{URI: document.URI, Text: document.Text, Range: matches[0].SelectionRange, DefinitionRange: matches[0].Range}, resolutionFound
 	default:
 		return Location{}, resolutionAmbiguous
 	}
@@ -318,6 +495,43 @@ func (i *Index) targetFileURIsLocked(source Document, targetFile string) []strin
 	return append([]string(nil), i.filenames[canonicalFilename(cleanTarget)]...)
 }
 
+func (i *Index) snapshotLocked() *Index {
+	return &Index{
+		disk:      cloneDocuments(i.disk),
+		overlays:  cloneDocuments(i.overlays),
+		paths:     cloneStringSlices(i.paths),
+		filenames: cloneStringSlices(i.filenames),
+		revision:  i.revision,
+	}
+}
+
+func cloneDocuments(source map[string]Document) map[string]Document {
+	result := make(map[string]Document, len(source))
+	for key, document := range source {
+		result[key] = document
+	}
+	return result
+}
+
+func cloneStringSlices(source map[string][]string) map[string][]string {
+	result := make(map[string][]string, len(source))
+	for key, values := range source {
+		result[key] = append([]string(nil), values...)
+	}
+	return result
+}
+
+func (i *Index) uriForPathLocked(fallbackURI, path string) string {
+	if path == "" {
+		return fallbackURI
+	}
+	matches := i.paths[canonicalPath(path)]
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	return fallbackURI
+}
+
 func (i *Index) documentLocked(uri string) (Document, bool) {
 	if document, ok := i.overlays[uri]; ok {
 		return document, true
@@ -330,8 +544,14 @@ func (i *Index) rebuildPathsLocked() {
 	i.paths = make(map[string][]string)
 	i.filenames = make(map[string][]string)
 	seen := make(map[string]bool)
+	overlaidPaths := make(map[string]bool, len(i.overlays))
+	for _, document := range i.overlays {
+		if document.Path != "" {
+			overlaidPaths[canonicalPath(document.Path)] = true
+		}
+	}
 	for uri, document := range i.disk {
-		if _, overlaid := i.overlays[uri]; overlaid {
+		if _, overlaid := i.overlays[uri]; overlaid || overlaidPaths[canonicalPath(document.Path)] {
 			continue
 		}
 		i.addPathLocked(uri, document.Path, seen)
