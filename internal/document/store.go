@@ -3,7 +3,7 @@ package document
 import (
 	"sync"
 
-	"example.com/run-myscreens-lsp/internal/model"
+	"github.com/LehMichael/run-myscreens-lsp/internal/model"
 )
 
 type Store struct {

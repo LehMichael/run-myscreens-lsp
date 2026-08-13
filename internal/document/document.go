@@ -5,8 +5,8 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
-	"example.com/run-myscreens-lsp/internal/model"
-	"example.com/run-myscreens-lsp/internal/protocol"
+	"github.com/LehMichael/run-myscreens-lsp/internal/model"
+	"github.com/LehMichael/run-myscreens-lsp/internal/protocol"
 )
 
 type Document struct {
@@ -53,6 +53,45 @@ func (d *Document) Range(startByte, endByte uint) protocol.Range {
 		endByte = startByte
 	}
 	return protocol.Range{Start: d.PositionAt(startByte), End: d.PositionAt(endByte)}
+}
+
+func (d *Document) ByteOffsetAt(position protocol.Position) (uint, bool) {
+	line := int(position.Line)
+	if line < 0 || line >= len(d.lineStarts) {
+		return 0, false
+	}
+	start := d.lineStarts[line]
+	end := len(d.Text)
+	if line+1 < len(d.lineStarts) {
+		end = d.lineStarts[line+1] - 1
+		if end > start && d.Text[end-1] == '\r' {
+			end--
+		}
+	}
+	targetUnits := int(position.Character)
+	units := 0
+	for offset := start; offset < end; {
+		if units == targetUnits {
+			return uint(offset), true
+		}
+		r, size := utf8.DecodeRuneInString(d.Text[offset:end])
+		if size == 0 {
+			break
+		}
+		runeUnits := 1
+		if r != utf8.RuneError || size > 1 {
+			runeUnits = len(utf16.Encode([]rune{r}))
+		}
+		if units+runeUnits > targetUnits {
+			return 0, false
+		}
+		units += runeUnits
+		offset += size
+	}
+	if units == targetUnits {
+		return uint(end), true
+	}
+	return 0, false
 }
 
 func (d *Document) reindex() {

@@ -47,8 +47,42 @@ type Fold struct {
 	Kind  FoldKind
 }
 
+type DefinitionKind uint8
+
+const (
+	DefinitionUnknown DefinitionKind = iota
+	DefinitionDialog
+	DefinitionSoftkeyMenu
+	DefinitionArray
+	DefinitionBlock
+	DefinitionGrid
+	DefinitionVariable
+	DefinitionSubprogram
+	DefinitionOutput
+	DefinitionArrayOrGrid
+)
+
+type Definition struct {
+	Name           string
+	Kind           DefinitionKind
+	Range          ByteRange
+	SelectionRange ByteRange
+	Scope          []ByteRange
+}
+
+type Reference struct {
+	Name       string
+	Kind       DefinitionKind
+	Range      ByteRange
+	Scope      []ByteRange
+	TargetFile string
+	FileRange  ByteRange
+}
+
 type Analysis struct {
 	Diagnostics []Diagnostic
 	Symbols     []Symbol
 	Folds       []Fold
+	Definitions []Definition
+	References  []Reference
 }

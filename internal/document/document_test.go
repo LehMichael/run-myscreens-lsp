@@ -3,8 +3,8 @@ package document
 import (
 	"testing"
 
-	"example.com/run-myscreens-lsp/internal/model"
-	"example.com/run-myscreens-lsp/internal/protocol"
+	"github.com/LehMichael/run-myscreens-lsp/internal/model"
+	"github.com/LehMichael/run-myscreens-lsp/internal/protocol"
 )
 
 func TestPositionAtUsesUTF16CodeUnits(t *testing.T) {
@@ -25,6 +25,40 @@ func TestPositionAtUsesUTF16CodeUnits(t *testing.T) {
 		if got := document.PositionAt(test.byteOffset); got != test.want {
 			t.Errorf("PositionAt(%d) = %#v, want %#v", test.byteOffset, got, test.want)
 		}
+	}
+}
+
+func TestByteOffsetAtUsesUTF16CodeUnits(t *testing.T) {
+	document := New("file:///test.com", "run-myscreens", 1, "a😀ö\nβ")
+
+	tests := []struct {
+		position protocol.Position
+		want     uint
+		ok       bool
+	}{
+		{protocol.Position{Line: 0, Character: 0}, 0, true},
+		{protocol.Position{Line: 0, Character: 1}, 1, true},
+		{protocol.Position{Line: 0, Character: 3}, 5, true},
+		{protocol.Position{Line: 0, Character: 4}, 7, true},
+		{protocol.Position{Line: 1, Character: 1}, 10, true},
+		{protocol.Position{Line: 0, Character: 2}, 0, false},
+		{protocol.Position{Line: 2, Character: 0}, 0, false},
+	}
+	for _, test := range tests {
+		got, ok := document.ByteOffsetAt(test.position)
+		if got != test.want || ok != test.ok {
+			t.Errorf("ByteOffsetAt(%#v) = %d, %v; want %d, %v", test.position, got, ok, test.want, test.ok)
+		}
+	}
+}
+
+func TestByteOffsetAtRejectsPositionInsideCRLF(t *testing.T) {
+	document := New("file:///test.com", "run-myscreens", 1, "a\r\nb")
+	if got, ok := document.ByteOffsetAt(protocol.Position{Line: 0, Character: 1}); !ok || got != 1 {
+		t.Fatalf("line end = %d, %v; want 1, true", got, ok)
+	}
+	if _, ok := document.ByteOffsetAt(protocol.Position{Line: 0, Character: 2}); ok {
+		t.Fatal("accepted a position inside CRLF")
 	}
 }
 

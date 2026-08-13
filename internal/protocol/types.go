@@ -92,6 +92,16 @@ type FoldingRangeParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
 }
 
+type TextDocumentPositionParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+}
+
+type Location struct {
+	URI   string `json:"uri"`
+	Range Range  `json:"range"`
+}
+
 type DocumentSymbol struct {
 	Name           string           `json:"name"`
 	Detail         string           `json:"detail,omitempty"`
@@ -109,10 +119,16 @@ type FoldingRange struct {
 	Kind           string `json:"kind,omitempty"`
 }
 
+type WorkspaceFolder struct {
+	URI  string `json:"uri"`
+	Name string `json:"name"`
+}
+
 type InitializeParams struct {
-	ProcessID    *int32 `json:"processId,omitempty"`
-	RootURI      string `json:"rootUri,omitempty"`
-	Capabilities any    `json:"capabilities,omitempty"`
+	ProcessID        *int32            `json:"processId,omitempty"`
+	RootURI          string            `json:"rootUri,omitempty"`
+	WorkspaceFolders []WorkspaceFolder `json:"workspaceFolders,omitempty"`
+	Capabilities     any               `json:"capabilities,omitempty"`
 }
 
 type InitializeResult struct {
@@ -125,6 +141,7 @@ type ServerCapabilities struct {
 	TextDocumentSync       TextDocumentSyncOptions `json:"textDocumentSync"`
 	DocumentSymbolProvider bool                    `json:"documentSymbolProvider"`
 	FoldingRangeProvider   bool                    `json:"foldingRangeProvider"`
+	DefinitionProvider     bool                    `json:"definitionProvider"`
 }
 
 type TextDocumentSyncOptions struct {

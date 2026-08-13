@@ -16,9 +16,13 @@ Current foundation:
 - Parser-independent semantic document model cached by document version
 - Hierarchical document symbols for definitions, declarations, events, subprograms, and outputs
 - Folding ranges for definitions, events, subprograms, conditionals, switches, loops, and outputs
+- Recursive `.com` workspace indexing across initial workspace folders
+- Open-document overlays with close-time disk refresh
+- Case-insensitive, spelling-preserving definition lookup
+- `textDocument/definition` for local variables, same-file `CALL`/`GC`, explicitly named `LM`/`LS`/`LB`/`LA` targets, and calls into explicitly loaded block files
 - Diagnostic clearing when a document closes
 
-The grammar dependency uses a local `replace` during development. Replace the temporary `example.com` module paths only after public repository ownership is decided.
+Definition resolution is intentionally conservative: dynamic expressions and ambiguous targets return no result rather than guessing. The grammar dependency is versioned from [`github.com/LehMichael/tree-sitter-run-myscreens`](https://github.com/LehMichael/tree-sitter-run-myscreens).
 
 ## Development
 

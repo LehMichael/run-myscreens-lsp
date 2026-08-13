@@ -5,9 +5,9 @@ import (
 	"log"
 	"os"
 
-	"example.com/run-myscreens-lsp/internal/protocol"
-	"example.com/run-myscreens-lsp/internal/server"
-	"example.com/run-myscreens-lsp/internal/syntax"
+	"github.com/LehMichael/run-myscreens-lsp/internal/protocol"
+	"github.com/LehMichael/run-myscreens-lsp/internal/server"
+	"github.com/LehMichael/run-myscreens-lsp/internal/syntax"
 )
 
 func main() {

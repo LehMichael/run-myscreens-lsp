@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"example.com/run-myscreens-lsp/internal/model"
+	"github.com/LehMichael/run-myscreens-lsp/internal/model"
 )
 
 func TestAnalyzeValidSource(t *testing.T) {
@@ -40,6 +40,107 @@ func TestAnalyzeInvalidProse(t *testing.T) {
 	}
 	if len(analysis.Diagnostics) == 0 || analysis.Diagnostics[0].Code != "syntax-error" {
 		t.Fatalf("diagnostics = %#v, want syntax-error", analysis.Diagnostics)
+	}
+}
+
+func TestAnalyzeLowersDefinitionsAndStaticReferences(t *testing.T) {
+	source := []byte("//M(Main)\n" +
+		"DEF Items=(I/0/1)\n" +
+		"LOAD\n" +
+		"  CALL(\"Update\")\n" +
+		"  GC(\"A \"\"quoted\"\" output\")\n" +
+		"  LM(\"Other\", \"Shared.COM\")\n" +
+		"  LS(\"Menu\",,1)\n" +
+		"  CALL(dynamicName)\n" +
+		"  object.CALL(\"Ignored\")\n" +
+		"  Items[0]=Items+1\n" +
+		"END_LOAD\n" +
+		"SUB(Update)\n" +
+		"END_SUB\n" +
+		"OUTPUT(A)\n" +
+		"END_OUTPUT\n" +
+		"//END\n")
+	analysis, err := NewTreeSitterAnalyzer().Analyze(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if len(analysis.Diagnostics) != 0 {
+		t.Fatalf("diagnostics = %#v", analysis.Diagnostics)
+	}
+	if len(analysis.Definitions) != 4 {
+		t.Fatalf("definitions = %#v, want dialog, variable, subprogram, output", analysis.Definitions)
+	}
+	wantDefinitions := []struct {
+		name  string
+		kind  model.DefinitionKind
+		scope int
+	}{
+		{"Main", model.DefinitionDialog, 0},
+		{"Items", model.DefinitionVariable, 1},
+		{"Update", model.DefinitionSubprogram, 1},
+		{"A", model.DefinitionOutput, 1},
+	}
+	for index, want := range wantDefinitions {
+		got := analysis.Definitions[index]
+		if got.Name != want.name || got.Kind != want.kind || len(got.Scope) != want.scope {
+			t.Errorf("definition %d = %#v, want name=%q kind=%d scope=%d", index, got, want.name, want.kind, want.scope)
+		}
+	}
+	if len(analysis.References) != 7 {
+		t.Fatalf("references = %#v, want four static calls plus dynamicName, indexed Items, and plain Items variables", analysis.References)
+	}
+	wantReferences := []struct {
+		name       string
+		kind       model.DefinitionKind
+		targetFile string
+	}{
+		{"Update", model.DefinitionSubprogram, ""},
+		{"A \"quoted\" output", model.DefinitionOutput, ""},
+		{"Other", model.DefinitionDialog, "Shared.COM"},
+		{"Menu", model.DefinitionSoftkeyMenu, ""},
+		{"dynamicName", model.DefinitionVariable, ""},
+		{"Items", model.DefinitionArrayOrGrid, ""},
+		{"Items", model.DefinitionVariable, ""},
+	}
+	for index, want := range wantReferences {
+		got := analysis.References[index]
+		if got.Name != want.name || got.Kind != want.kind || got.TargetFile != want.targetFile || len(got.Scope) != 1 {
+			t.Errorf("reference %d = %#v, want name=%q kind=%d target=%q scope=1", index, got, want.name, want.kind, want.targetFile)
+		}
+	}
+}
+
+func TestAnalyzeLowersAllTopLevelDefinitionKinds(t *testing.T) {
+	source := []byte("//M{Modern,HD=\"Mask\"}\n//END\n" +
+		"//S(Menu)\n//END\n" +
+		"//A(Values)\n//END\n" +
+		"//B(Block)\n//END\n" +
+		"//G(Grid)\n//END\n")
+	analysis, err := NewTreeSitterAnalyzer().Analyze(context.Background(), source)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if len(analysis.Diagnostics) != 0 {
+		t.Fatalf("diagnostics = %#v", analysis.Diagnostics)
+	}
+	want := []struct {
+		name string
+		kind model.DefinitionKind
+	}{
+		{"Modern", model.DefinitionDialog},
+		{"Menu", model.DefinitionSoftkeyMenu},
+		{"Values", model.DefinitionArray},
+		{"Block", model.DefinitionBlock},
+		{"Grid", model.DefinitionGrid},
+	}
+	if len(analysis.Definitions) != len(want) {
+		t.Fatalf("definitions = %#v", analysis.Definitions)
+	}
+	for index, expected := range want {
+		got := analysis.Definitions[index]
+		if got.Name != expected.name || got.Kind != expected.kind {
+			t.Errorf("definition %d = %#v, want name=%q kind=%d", index, got, expected.name, expected.kind)
+		}
 	}
 }
 

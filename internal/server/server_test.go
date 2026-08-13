@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"testing"
 
-	"example.com/run-myscreens-lsp/internal/protocol"
-	"example.com/run-myscreens-lsp/internal/syntax"
+	"github.com/LehMichael/run-myscreens-lsp/internal/protocol"
+	"github.com/LehMichael/run-myscreens-lsp/internal/syntax"
+	"github.com/LehMichael/run-myscreens-lsp/internal/workspace"
 )
 
 func TestProtocolLifecyclePublishesDiagnosticsSymbolsAndFolds(t *testing.T) {
@@ -89,6 +92,62 @@ func TestProtocolLifecyclePublishesDiagnosticsSymbolsAndFolds(t *testing.T) {
 	}
 	if string(messages[6].ID) != "2" || string(messages[6].Result) != "null" {
 		t.Fatalf("shutdown response = %#v", messages[6])
+	}
+}
+
+func TestDefinitionResolvesSameAndCrossFileWithUTF16Ranges(t *testing.T) {
+	root := t.TempDir()
+	targetPath := filepath.Join(root, "Shared.com")
+	if err := os.WriteFile(targetPath, []byte("; 😀\n//M(Target)\n//END\n"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	uri := workspace.FileURI(filepath.Join(root, "Main.com"))
+	source := "; 😀\n//M(Main)\nDEF value=(I/0/1)\nLOAD\n  value=\"😀\" << CALL(\"local\")\n  LM(\"TARGET\", \"shared.COM\")\nEND_LOAD\nSUB(Local)\nEND_SUB\n//END\n"
+	input := bytes.NewBufferString(
+		frameJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"rootUri": workspace.FileURI(root), "capabilities": map[string]any{}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": "run-myscreens", "version": 1, "text": source}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "textDocument/definition", "params": map[string]any{"textDocument": map[string]any{"uri": uri}, "position": map[string]any{"line": 4, "character": 23}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "textDocument/definition", "params": map[string]any{"textDocument": map[string]any{"uri": uri}, "position": map[string]any{"line": 5, "character": 7}}}) +
+			frameJSON(map[string]any{"jsonrpc": "2.0", "id": 4, "method": "textDocument/definition", "params": map[string]any{"textDocument": map[string]any{"uri": uri}, "position": map[string]any{"line": 4, "character": 3}}}) +
+			frame(`{"jsonrpc":"2.0","id":5,"method":"shutdown"}`) +
+			frame(`{"jsonrpc":"2.0","method":"exit"}`),
+	)
+	var output bytes.Buffer
+	languageServer := New(protocol.NewConnection(input, &output), syntax.NewTreeSitterAnalyzer(), log.New(io.Discard, "", 0))
+	if err := languageServer.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	messages := readMessages(t, &output)
+	if len(messages) != 6 {
+		t.Fatalf("message count = %d, want 6: %#v", len(messages), messages)
+	}
+	var initialize protocol.InitializeResult
+	if err := json.Unmarshal(messages[0].Result, &initialize); err != nil {
+		t.Fatalf("decode initialize: %v", err)
+	}
+	if !initialize.Capabilities.DefinitionProvider {
+		t.Fatal("definition provider was not advertised")
+	}
+	var sameFile protocol.Location
+	if err := json.Unmarshal(messages[2].Result, &sameFile); err != nil {
+		t.Fatalf("decode same-file location: %v", err)
+	}
+	if sameFile.URI != uri || sameFile.Range.Start != (protocol.Position{Line: 7, Character: 4}) || sameFile.Range.End != (protocol.Position{Line: 7, Character: 9}) {
+		t.Fatalf("same-file location = %#v", sameFile)
+	}
+	var crossFile protocol.Location
+	if err := json.Unmarshal(messages[3].Result, &crossFile); err != nil {
+		t.Fatalf("decode cross-file location: %v", err)
+	}
+	if crossFile.URI != workspace.FileURI(targetPath) || crossFile.Range.Start != (protocol.Position{Line: 1, Character: 4}) || crossFile.Range.End != (protocol.Position{Line: 1, Character: 10}) {
+		t.Fatalf("cross-file location = %#v", crossFile)
+	}
+	var variable protocol.Location
+	if err := json.Unmarshal(messages[4].Result, &variable); err != nil {
+		t.Fatalf("decode variable location: %v", err)
+	}
+	if variable.URI != uri || variable.Range.Start != (protocol.Position{Line: 2, Character: 4}) || variable.Range.End != (protocol.Position{Line: 2, Character: 9}) {
+		t.Fatalf("variable location = %#v", variable)
 	}
 }
 

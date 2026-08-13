@@ -8,10 +8,11 @@ import (
 	"io"
 	"log"
 
-	"example.com/run-myscreens-lsp/internal/document"
-	"example.com/run-myscreens-lsp/internal/model"
-	"example.com/run-myscreens-lsp/internal/protocol"
-	"example.com/run-myscreens-lsp/internal/syntax"
+	"github.com/LehMichael/run-myscreens-lsp/internal/document"
+	"github.com/LehMichael/run-myscreens-lsp/internal/model"
+	"github.com/LehMichael/run-myscreens-lsp/internal/protocol"
+	"github.com/LehMichael/run-myscreens-lsp/internal/syntax"
+	"github.com/LehMichael/run-myscreens-lsp/internal/workspace"
 )
 
 const (
@@ -23,6 +24,7 @@ type Server struct {
 	connection  *protocol.Connection
 	documents   *document.Store
 	analyzer    syntax.Analyzer
+	workspace   *workspace.Index
 	logger      *log.Logger
 	initialized bool
 	shutdown    bool
@@ -33,6 +35,7 @@ func New(connection *protocol.Connection, analyzer syntax.Analyzer, logger *log.
 		connection: connection,
 		documents:  document.NewStore(),
 		analyzer:   analyzer,
+		workspace:  workspace.New(),
 		logger:     logger,
 	}
 }
@@ -83,6 +86,16 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 				return fmt.Errorf("decode initialize params: %w", err)
 			}
 		}
+		var rootURIs []string
+		for _, folder := range params.WorkspaceFolders {
+			rootURIs = append(rootURIs, folder.URI)
+		}
+		if len(rootURIs) == 0 && params.RootURI != "" {
+			rootURIs = append(rootURIs, params.RootURI)
+		}
+		if err := s.workspace.Load(ctx, rootURIs, s.analyzer); err != nil {
+			return err
+		}
 		s.initialized = true
 		return s.connection.Reply(message.ID, protocol.InitializeResult{
 			Capabilities: protocol.ServerCapabilities{
@@ -90,6 +103,7 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 				TextDocumentSync:       protocol.TextDocumentSyncOptions{OpenClose: true, Change: 1},
 				DocumentSymbolProvider: true,
 				FoldingRangeProvider:   true,
+				DefinitionProvider:     true,
 			},
 			ServerInfo: protocol.ServerInfo{Name: serverName, Version: serverVersion},
 		})
@@ -128,6 +142,9 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 			return fmt.Errorf("decode didClose params: %w", err)
 		}
 		s.documents.Close(params.TextDocument.URI)
+		if err := s.workspace.RemoveOverlay(ctx, params.TextDocument.URI, s.analyzer); err != nil {
+			return err
+		}
 		return s.connection.Notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{
 			URI: params.TextDocument.URI, Diagnostics: []protocol.Diagnostic{},
 		})
@@ -141,6 +158,16 @@ func (s *Server) handle(ctx context.Context, message protocol.Message) error {
 			return fmt.Errorf("document %q is not open", params.TextDocument.URI)
 		}
 		return s.connection.Reply(message.ID, documentSymbols(&doc, doc.Analysis.Symbols))
+	case "textDocument/definition":
+		var params protocol.TextDocumentPositionParams
+		if err := json.Unmarshal(message.Params, &params); err != nil {
+			return fmt.Errorf("decode definition params: %w", err)
+		}
+		location, ok := s.definition(params)
+		if !ok {
+			return s.connection.Reply(message.ID, nil)
+		}
+		return s.connection.Reply(message.ID, location)
 	case "textDocument/foldingRange":
 		var params protocol.FoldingRangeParams
 		if err := json.Unmarshal(message.Params, &params); err != nil {
@@ -168,6 +195,7 @@ func (s *Server) publishDiagnostics(ctx context.Context, doc *document.Document)
 		return fmt.Errorf("document %q changed while it was being analyzed", doc.URI)
 	}
 	doc.Analysis = analysis
+	s.workspace.Overlay(doc.URI, doc.Text, analysis)
 	items := make([]protocol.Diagnostic, 0, len(analysis.Diagnostics))
 	for _, diagnostic := range analysis.Diagnostics {
 		items = append(items, protocol.Diagnostic{
@@ -182,6 +210,47 @@ func (s *Server) publishDiagnostics(ctx context.Context, doc *document.Document)
 	return s.connection.Notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{
 		URI: doc.URI, Version: &version, Diagnostics: items,
 	})
+}
+
+func (s *Server) definition(params protocol.TextDocumentPositionParams) (*protocol.Location, bool) {
+	doc, ok := s.documents.Get(params.TextDocument.URI)
+	if !ok {
+		indexed, indexedOK := s.workspace.Document(params.TextDocument.URI)
+		if !indexedOK {
+			return nil, false
+		}
+		doc = *document.New(indexed.URI, "run-myscreens", 0, indexed.Text)
+		doc.Analysis = indexed.Analysis
+	}
+	offset, ok := doc.ByteOffsetAt(params.Position)
+	if !ok {
+		return nil, false
+	}
+	reference, ok := referenceAt(doc.Analysis.References, offset)
+	if !ok {
+		return nil, false
+	}
+	resolved, ok := s.workspace.Resolve(doc.URI, reference)
+	if !ok {
+		return nil, false
+	}
+	target := document.New(resolved.URI, "run-myscreens", 0, resolved.Text)
+	return &protocol.Location{URI: resolved.URI, Range: target.Range(resolved.Range.Start, resolved.Range.End)}, true
+}
+
+func referenceAt(references []model.Reference, offset uint) (model.Reference, bool) {
+	var best model.Reference
+	found := false
+	for _, reference := range references {
+		if offset < reference.Range.Start || offset >= reference.Range.End {
+			continue
+		}
+		if !found || reference.Range.End-reference.Range.Start < best.Range.End-best.Range.Start {
+			best = reference
+			found = true
+		}
+	}
+	return best, found
 }
 
 func documentSymbols(doc *document.Document, symbols []model.Symbol) []protocol.DocumentSymbol {
